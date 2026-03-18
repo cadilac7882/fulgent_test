@@ -131,7 +131,6 @@ def process_result_summary(result_path, chipid):
     samplelist = os.listdir(result_path)
     run_qc_to_database(result_path)
     sample_qc_to_database(result_path)
-    print("--")
     variant_to_database(result_path,chipid)
 
 def check_run_completion(folder_path: str) -> bool:
@@ -332,7 +331,10 @@ def safe_decrypt(x):
 
 
 def safe_json_value(val):
-    """ 處理存進josn中的NaN """
+    """
+    處理存進josn中的NaN 
+    2026/3/17 update
+    """
     if isinstance(val, dict):
         return {k: safe_json_value(v) for k, v in val.items()}
     if isinstance(val, list):
@@ -346,129 +348,139 @@ def safe_json_value(val):
     return val
 
 def variant_to_database(result_path,chipID):
+    """
+    Insert variant into psql
+    2026/3/17 update
+    """
     sql = f"""SELECT "sampleSNo" from sample_info where "chipSNo" =  '{chipID}' """
     samples=sqlquery(sql)
     for sample in samples['sampleSNo']:
         ## 讀取opencravat註解結果 (sqlite)
         print(f"load variant for sample {sample}")
-        conn = sqlite3.connect(f"{result_path}/{sample}/opencravat/{sample}.hard-filtered.sqlite")
-        variant_table=pd.read_sql_query("SELECT * FROM variant ;", conn)
-        ## 讀取inhouse-filteration的結果 (xlsx)
-        filtered_table=pd.read_excel(f"{result_path}/{sample}/{sample}_filtered.xlsx")
-        ## 合併兩表並以report欄位標示是否為篩選結果
-        variant_table=variant_table.merge(filtered_table.assign(report=True),
-                    left_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
-                    right_on=['Chrom','Position','Ref Base','Alt Base'],
-                    how='left')
-        variant_table['report']= variant_table['report'].astype('boolean').fillna(False)
-        variant_table['base__exonno']=variant_table['base__exonno'].astype("Int64") 
-        ## insert rows to psql
-        for i in range(0,variant_table.shape[0]):
-            uniID=f"{sample}_{chipID}"
-            variantID=i
-            uniVID=f"{uniID}_{variantID}"
-            chrom=variant_table['base__chrom'][i]
-            pos=int(variant_table['base__pos'][i])
-            ref=variant_table['base__ref_base'][i]
-            alt=variant_table['base__alt_base'][i]
-            dbsnp=variant_table['dbsnp__rsid'][i]
-            report=bool(variant_table['report'][i])
-            consequence=safe_json_value({
-                "gene":variant_table['base__hugo'][i],
-                "transcript":variant_table['base__transcript'][i],
-                "hgvsc":variant_table['base__cchange'][i],
-                "hgvsp":variant_table['base__achange'][i],
-                "exon": safe_json_value(variant_table['base__exonno'][i]),
-                "sequence_ontology":variant_table['base__so'][i]
-            }) 
-            population={
-                "gnomad":{
-                    "global":safe_json_value({
-                        "AC":variant_table['gnomad4__ac'][i],
-                        "AN":variant_table['gnomad4__an'][i],
-                        "AF":variant_table['gnomad4__af'][i],
-                        "Homo":variant_table['gnomad4__nhomalt'][i],
+        if(os.path.exists(f"{result_path}/{sample}")):
+            conn = sqlite3.connect(f"{result_path}/{sample}/opencravat/{sample}.hard-filtered.sqlite")
+            variant_table=pd.read_sql_query("SELECT * FROM variant ;", conn)
+            ## 讀取inhouse-filteration的結果 (xlsx)
+            filtered_table=pd.read_excel(f"{result_path}/{sample}/{sample}_filtered.xlsx")
+            ## 合併兩表並以report欄位標示是否為篩選結果
+            variant_table=variant_table.merge(filtered_table.assign(report=True),
+                        left_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
+                        right_on=['Chrom','Position','Ref Base','Alt Base'],
+                        how='left')
+            variant_table['report']= variant_table['report'].astype('boolean').fillna(False)
+            variant_table['base__exonno']=variant_table['base__exonno'].astype("Int64") 
+            ## insert rows to psql
+            for i in range(0,variant_table.shape[0]):
+                uniID=f"{sample}_{chipID}"
+                variantID=i
+                uniVID=f"{uniID}_{variantID}"
+                chrom=variant_table['base__chrom'][i]
+                pos=int(variant_table['base__pos'][i])
+                ref=variant_table['base__ref_base'][i]
+                alt=variant_table['base__alt_base'][i]
+                dbsnp=variant_table['dbsnp__rsid'][i]
+                report=bool(variant_table['report'][i])
+                consequence=safe_json_value({
+                    "gene":variant_table['base__hugo'][i],
+                    "transcript":variant_table['base__transcript'][i],
+                    "hgvsc":variant_table['base__cchange'][i],
+                    "hgvsp":variant_table['base__achange'][i],
+                    "exon": safe_json_value(variant_table['base__exonno'][i]),
+                    "sequence_ontology":variant_table['base__so'][i]
+                }) 
+                population={
+                    "gnomad":{
+                        "global":safe_json_value({
+                            "AC":variant_table['gnomad4__ac'][i],
+                            "AN":variant_table['gnomad4__an'][i],
+                            "AF":variant_table['gnomad4__af'][i],
+                            "Homo":variant_table['gnomad4__nhomalt'][i],
+                        }),
+                        "AFR":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_afr'][i],
+                            "AN":variant_table['gnomad4__an_afr'][i],
+                            "AF":variant_table['gnomad4__af_afr'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_afr'][i],
+                        }),
+                        "AMR":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_amr'][i],
+                            "AN":variant_table['gnomad4__an_amr'][i],
+                            "AF":variant_table['gnomad4__af_amr'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_amr'][i],
+                        }),
+                        "EAS":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_eas'][i],
+                            "AN":variant_table['gnomad4__an_eas'][i],
+                            "AF":variant_table['gnomad4__af_eas'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_eas'][i],
+                        }),
+                        "SAS":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_sas'][i],
+                            "AN":variant_table['gnomad4__an_sas'][i],
+                            "AF":variant_table['gnomad4__af_sas'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_sas'][i],
+                        }),
+                        "FIN":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_fin'][i],
+                            "AN":variant_table['gnomad4__an_fin'][i],
+                            "AF":variant_table['gnomad4__af_fin'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_fin'][i],
+                        }),
+                        "NFE":safe_json_value({
+                            "AC":variant_table['gnomad4__ac_nfe'][i],
+                            "AN":variant_table['gnomad4__an_nfe'][i],
+                            "AF":variant_table['gnomad4__af_nfe'][i],
+                            "Homo":variant_table['gnomad4__nhomalt_nfe'][i],
+                        })
+                    }
+                }
+                clinvar=safe_json_value({
+                    "clininical_significance":variant_table['clinvar__sig'][i],
+                    "review_status":variant_table['clinvar__rev_stat'][i],
+                    "clinvar_id":variant_table['clinvar__id'][i],
+                    "significance_detail":variant_table['clinvar__sig_conf'][i],
+                })
+                vcf_info=safe_json_value({
+                    "total_reads":variant_table['vcfinfo__tot_reads'][i],
+                    "alt_reads":variant_table['vcfinfo__alt_reads'][i],
+                    "allele_fraction":variant_table['vcfinfo__af'][i],
+                    "quality":variant_table['vcfinfo__phred'][i],
+                    "zygosity":variant_table['vcfinfo__zygosity'][i],
+                    "filter":variant_table['vcfinfo__filter'][i]
+                })
+                prediction={
+                    "spliceai":safe_json_value({
+                        "score":variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]].max(),
+                        "class":"Pathogenic" if (variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]]>0.5).any() else None
                     }),
-                    "AFR":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_afr'][i],
-                        "AN":variant_table['gnomad4__an_afr'][i],
-                        "AF":variant_table['gnomad4__af_afr'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_afr'][i],
+                    "dbscsnv_ada":safe_json_value({
+                        "score":variant_table['dbscsnv__ada_score'][i],
+                        "class":"Pathogenic" if variant_table['dbscsnv__ada_score'][i]>0.7 else None
                     }),
-                    "AMR":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_amr'][i],
-                        "AN":variant_table['gnomad4__an_amr'][i],
-                        "AF":variant_table['gnomad4__af_amr'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_amr'][i],
+                    "revel":safe_json_value({
+                        "score":variant_table['revel__rankscore'][i],
+                        "class":f"Pathogenic_{variant_table['revel__pp3_pathogenic'][i]}" if pd.notna(variant_table['revel__pp3_pathogenic'][i]) else None
                     }),
-                    "EAS":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_eas'][i],
-                        "AN":variant_table['gnomad4__an_eas'][i],
-                        "AF":variant_table['gnomad4__af_eas'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_eas'][i],
-                    }),
-                    "SAS":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_sas'][i],
-                        "AN":variant_table['gnomad4__an_sas'][i],
-                        "AF":variant_table['gnomad4__af_sas'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_sas'][i],
-                    }),
-                    "FIN":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_fin'][i],
-                        "AN":variant_table['gnomad4__an_fin'][i],
-                        "AF":variant_table['gnomad4__af_fin'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_fin'][i],
-                    }),
-                    "NFE":safe_json_value({
-                        "AC":variant_table['gnomad4__ac_nfe'][i],
-                        "AN":variant_table['gnomad4__an_nfe'][i],
-                        "AF":variant_table['gnomad4__af_nfe'][i],
-                        "Homo":variant_table['gnomad4__nhomalt_nfe'][i],
+                    "vest4":safe_json_value({
+                        "score":variant_table['vest__score'][i],
+                        "class":f"Pathogenic_{variant_table['vest__pp3_pathogenic'][i]}" if pd.notna(variant_table['vest__pp3_pathogenic'][i]) else None
                     })
                 }
-            }
-            clinvar=safe_json_value({
-                "clininical_significance":variant_table['clinvar__sig'][i],
-                "review_status":variant_table['clinvar__rev_stat'][i],
-                "clinvar_id":variant_table['clinvar__id'][i],
-                "significance_detail":variant_table['clinvar__sig_conf'][i],
-            })
-            vcf_info=safe_json_value({
-                "total_reads":variant_table['vcfinfo__tot_reads'][i],
-                "alt_reads":variant_table['vcfinfo__alt_reads'][i],
-                "allele_fraction":variant_table['vcfinfo__af'][i],
-                "quality":variant_table['vcfinfo__phred'][i],
-                "zygosity":variant_table['vcfinfo__zygosity'][i],
-                "filter":variant_table['vcfinfo__filter'][i]
-            })
-            prediction={
-                "spliceai":safe_json_value({
-                    "score":variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]].max(),
-                    "class":"Pathogenic" if (variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]]>0.5).any() else None
-                }),
-                "dbscsnv_ada":safe_json_value({
-                    "score":variant_table['dbscsnv__ada_score'][i],
-                    "class":"Pathogenic" if variant_table['dbscsnv__ada_score'][i]>0.7 else None
-                }),
-                "revel":safe_json_value({
-                    "score":variant_table['revel__rankscore'][i],
-                    "class":f"Pathogenic_{variant_table['revel__pp3_pathogenic'][i]}" if pd.notna(variant_table['revel__pp3_pathogenic'][i]) else None
-                }),
-                "vest4":safe_json_value({
-                    "score":variant_table['vest__score'][i],
-                    "class":f"Pathogenic_{variant_table['vest__pp3_pathogenic'][i]}" if pd.notna(variant_table['vest__pp3_pathogenic'][i]) else None
-                })
-            }
-            sqlexe(
-                """
-                INSERT INTO sample_small_variant ("UniVID", "UniID", "variantID", "chrom", "pos","ref_base","alt_base","dbsnp","report","consequence","population","clinvar","vcf_info","prediction")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT ("UniVID") DO NOTHING
-                """,
-                [uniVID, uniID, variantID, chrom, pos, ref, alt, dbsnp, report, json.dumps(consequence), json.dumps(population), 
-                 json.dumps(clinvar),json.dumps(vcf_info),json.dumps(prediction)]
-            )
-        print(f"Completed!")
+                sqlexe(
+                    """
+                    INSERT INTO sample_small_variant ("UniVID", "UniID", "variantID", "chrom", "pos","ref_base","alt_base","dbsnp","report","consequence","population","clinvar","vcf_info","prediction")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT ("UniVID") DO NOTHING
+                    """,
+                    [uniVID, uniID, variantID, chrom, pos, ref, alt, dbsnp, report, json.dumps(consequence), json.dumps(population), 
+                    json.dumps(clinvar),json.dumps(vcf_info),json.dumps(prediction)]
+                )
+            print(f"Completed!")
+        else:
+            print(f"no analytic result is found for sample {sample}")
+            
+    
+        
 
 
             
@@ -480,6 +492,9 @@ def variant_to_database(result_path,chipID):
 ## WESCoreAnalysis Section
 ### API-T01
 def coreanalysis(request):
+    """
+    2026/3/18 update
+    """
     # Get filter metadata
     try:
         userid = request.POST['userid']
@@ -491,24 +506,28 @@ def coreanalysis(request):
         findendtime = request.POST['findendtime']
         finderrortype = request.POST['finderrortype']
         finddetail = request.POST['finddetail']
-        print([userid,finditem,findspecimen,findsample,findchip,findstarttime,findendtime,finderrortype,finddetail])
+
         if userid is None:
             return JsonResponse({"Code":500, "Msg":"Error found on server"})
 
         # Datatable niptcoreanalysis
-        sql = """select "testidx","testItem", "redrawBlood", "status", "testDetail", "specimenNumber","duprate", "qualified" as "originalQualityControl", "sampleSNo", "chipSNo", "pregnantName", "bloodCollectionTime", "twin" as "birth" , "adapterPercent", "Total_rds" as "totalRds", "UniMap_rds" as "uniMapRds", "fetal" as "ff" , "GCContent", "NIPTTestResults", "CNVTestResults", "sequencingDate", "analysisTime"  from niptcoreanalysis where "sampleSNo" IN (SELECT "sampleSNo" from "sample_metadata" where "supplement" = '樣本錄入')"""
-        tnipt = sqlquery(sql)
+        sql = """select * from wescoreanalysis"""
+        twes = sqlquery(sql)
 
         # Filter by item
+        '''
         if finditem != '全部':
             tnipt = tnipt[tnipt['testItem'] == finditem]
-
+        '''
         # Filter by specimen
+        '''
         if len(findspecimen) != 0:
             tnipt = tnipt[tnipt['specimenNumber'] == findspecimen]
-
+        '''
         # Filter by sample (用前9碼去對應)
         if len(findsample) != 0:
+            twes=twes[twes['sampleSNo'].str.contains(findsample)]
+            '''
             if findsample.startswith("PC"):
                 # PC → 前 6 碼
                 tnipt = tnipt[tnipt['sampleSNo'].str[:6] == findsample[:6]]
@@ -518,10 +537,11 @@ def coreanalysis(request):
             else:
                 # 其他 → 前 9 碼
                 tnipt = tnipt[tnipt['sampleSNo'].str[:9] == findsample[:9]]
+            '''
 
         # Filter by chip
         if len(findchip) != 0:
-            tnipt = tnipt[tnipt['chipSNo'] == findchip]
+            twes = twes[twes['chipSNo'] == findchip]
 
         # Filter by time
         if len(findstarttime) != 0:
@@ -533,22 +553,25 @@ def coreanalysis(request):
             tnipt = tnipt[tnipt['sequencingDate'] <= endtime]
 
         # Filter by detail
+        '''
         if finddetail != '全部':
             tnipt = tnipt[tnipt['testDetail'] == finddetail]
-
+        '''
         # Filter by detail
+        '''
         if finderrortype != '無':
             tnipt =  tnipt[tnipt['redrawBlood'] == finderrortype]
-
+        '''
         ## output
-        tnipt["totalRds"] = tnipt["totalRds"].apply(lambda x: f'{x:,}')
-        tnipt["uniMapRds"] = tnipt["uniMapRds"].apply(lambda x: f'{x:,}')
-        tnipt = tnipt.fillna("-")
-        tnipt = tnipt.replace('nan', '-').replace('', '-')
-        tnipt["NIPTTestResults"] = tnipt["NIPTTestResults"].replace('-', '低風險')
-        tnipt = convertTime(tnipt, 'bloodCollectionTime')
-        tnipt = convertTime(tnipt, 'analysisTime')
-        core_table = tnipt.to_json(orient='records')
+        #tnipt["totalRds"] = tnipt["totalRds"].apply(lambda x: f'{x:,}')
+        #tnipt["uniMapRds"] = tnipt["uniMapRds"].apply(lambda x: f'{x:,}')
+        twes = twes.fillna("-")
+        twes = twes.replace('nan', '-').replace('', '-')
+        #tnipt["NIPTTestResults"] = tnipt["NIPTTestResults"].replace('-', '低風險')
+        twes["NIPTTestResults"] = twes["report_variant_count"]
+        twes = convertTime(twes, 'sequencingDate')
+        twes = convertTime(twes, 'analysisTime')
+        core_table = twes.to_json(orient='records')
         core_table = json.loads(core_table)
         return JsonResponse({"Code":200, "Msg":{'user_id':userid, 'core_table':core_table}})
     except:
@@ -587,12 +610,13 @@ def coreanalysis_detail(request):
     if userid is None:
         return JsonResponse({"Code":500, "Msg":"Error found on server"})
     
-    T03sql = f"""SELECT
-        *,
-        "duprate" as "Duprate",
-        "status" as "analysisProcess" ,
-        "fetal" as "ff"
-        from "niptcoreanalysis" where "sampleSNo" = '{sampleid}' AND "chipSNo" = '{chipid}' """
+    T03sql = f"""SELECT chrom, pos, ref_base, alt_base, 
+        consequence->>gene as gene,
+        consequence->>hgvsc as hgvsc,
+        consequence->>hgvsp as hgvsp,
+        consequence->>transcript as transcript,
+        consequence->>transcript as transcript,
+                        from sample_small_variant where "UniID" = '{sampleid}_{chipid}'"""
     T03all= sqlquery(T03sql)
     T03all = T03all.apply(lambda x: float(x) if isinstance(x, Decimal) else x)
 
