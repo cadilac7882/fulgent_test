@@ -407,7 +407,6 @@ def variant_to_database(result_path,chipID):
             variant_cache = {}
             sample_variant_rows = []
             consequence_rows= []
-            print(variant_table.shape)
             for _, row in variant_table.iterrows():
                 row_dict=row.to_dict()
                 row_dict=safe_json_value(row_dict)
@@ -425,7 +424,7 @@ def variant_to_database(result_path,chipID):
                             INSERT INTO variant (chrom, pos, ref_base, alt_base)
                             VALUES (%s, %s, %s, %s)
                             ON CONFLICT (chrom, pos, ref_base, alt_base)
-                            DO NOTHING
+                            DO UPDATE SET chrom = EXCLUDED.chrom
                             RETURNING variant_id;
                             """, 
                             [chrom, pos, ref_base, alt_base],True)
@@ -453,7 +452,20 @@ def variant_to_database(result_path,chipID):
                     filter, quality, FS, QD, SOR, MQ, MQRankSum, ReadPosRankSum, report
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (sample_id, variant_id) DO NOTHING;
+                ON CONFLICT (sample_id, variant_id) DO UPDATE 
+                SET
+                    genotype       = EXCLUDED.genotype,
+                    total_reads    = EXCLUDED.total_reads,
+                    alt_reads      = EXCLUDED.alt_reads,
+                    filter         = EXCLUDED.filter, 
+                    quality        = EXCLUDED.quality, 
+                    FS             = EXCLUDED.FS, 
+                    QD             = EXCLUDED.QD, 
+                    SOR            = EXCLUDED.SOR, 
+                    MQ             = EXCLUDED.MQ, 
+                    MQRankSum      = EXCLUDED.MQRankSum, 
+                    ReadPosRankSum = EXCLUDED.ReadPosRankSum, 
+                    report         = EXCLUDED.report;
                 """,
                 sample_variant_rows
             )
@@ -464,11 +476,10 @@ def variant_to_database(result_path,chipID):
                     variant_id, gene, transcript, exon, hgvsc, hgvsp, impact, source
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (variant_id, transcript, source) DO NOTHING;
+                ON CONFLICT DO NOTHING;
                 """,
                 consequence_rows
             )
-            print(len(variant_cache))
             print(f"Completed!")
         else:
             print(f"no analytic result is found for sample {sample}")
