@@ -9,6 +9,7 @@ import subprocess
 from datetime import datetime, timedelta
 import uuid
 from django.db import connection
+from django.db import transaction
 import io
 from decimal import Decimal
 import psutil
@@ -21,9 +22,13 @@ from Crypto.Cipher import AES
 import base64
 from collections import Counter
 import sqlite3
+import numpy as np
+from typing import Optional, Tuple, Dict, Any, List
+import re
 
 #########################################setting####################################################
 NS2000_path = '/bioinfo/NS2000/RD/' #NS2000_path chipid位置
+annotators_path = "/home/bioinfo/ggawes/bin/modules/annotators"
 nextflow="/opt/nextflow"
 # fail_mail_list=['ChenGyiLin@BionetTX.com','KennethYang@GGA.ASIA']
 # success_mail_list=['ChenGyiLin@BionetTX.com','KennethYang@GGA.ASIA']
@@ -31,11 +36,18 @@ fail_mail_list=['ChenGyiLin@BionetTX.com']
 success_mail_list=['ChenGyiLin@BionetTX.com']
 KEY = 'GGANIPTSYSTEM0123456789876543210'.encode()
 #########################################function###################################################
-def sqlexe(query, params=None):
+def sqlexe(query, params=None, returnValue=False):
+    """
+    2026/03/20 update: accept arg"returnValue"
+    """
     try:
         with connection.cursor() as cursor:
             cursor.execute(query, params)
+            if returnValue:
+                return_value=cursor.fetchone()[0]
             connection.commit()
+        if returnValue:
+            return(return_value)
     except Exception as e:
         print("Database error:", e)
 
@@ -128,10 +140,10 @@ def sample_qc_to_database(result_path):
 def process_result_summary(result_path, chipid):
     sql = f"""UPDATE "sample_info" SET "status" = %s WHERE "chipSNo" = %s"""
     sqlexe(sql, ["分析完成", chipid])
-    samplelist = os.listdir(result_path)
     run_qc_to_database(result_path)
     sample_qc_to_database(result_path)
     variant_to_database(result_path,chipid)
+    import_to_database(result_path)
 
 def check_run_completion(folder_path: str) -> bool:
     """
@@ -295,12 +307,11 @@ def check_chip_status():
             #更新chipid狀態
             update_chip_info(chipid, '檢測分析已完成')
             process_result_summary(output_path, chipid)
-            import_to_database(output_path)
-        # else:
-        #     #更新chipid狀態
-        #     update_chip_info(chipid, '準備分析')
-        #     # 發送郵件通知分析失敗
-        #     # sending_mail_fail(chipid, output_path)
+        else:
+            #更新chipid狀態
+            update_chip_info(chipid, '準備分析')
+            # 發送郵件通知分析失敗
+            sending_mail_fail(chipid, output_path)
 
 def pad(text):
     return text + (16 - len(text) % 16) * ' '
@@ -333,7 +344,7 @@ def safe_decrypt(x):
 def safe_json_value(val):
     """
     處理存進josn中的NaN 
-    2026/3/17 update
+    2026/3/20 update: deal with bool
     """
     if isinstance(val, dict):
         return {k: safe_json_value(v) for k, v in val.items()}
@@ -341,16 +352,38 @@ def safe_json_value(val):
         return [safe_json_value(v) for v in val]
     if pd.isna(val):
         return None
+    if isinstance(val, bool):
+        return bool(val)
     if isinstance(val, (np.floating, float)):
         return float(val)
     if isinstance(val, (np.integer, int)):
         return int(val)
     return val
 
+def batch_upsert(
+        sql_query: str, 
+        rows: list,
+        batch_size: int = 1000):
+    """
+    Insert multiple rows batchly
+    """
+    if not rows:
+        return
+    with transaction.atomic():
+            with connection.cursor() as cursor:
+                for start in range(0, len(rows), batch_size):
+                    end = start + batch_size
+                    cursor.executemany(
+                        sql_query, 
+                        rows[start:end]
+                    )
+
 def variant_to_database(result_path,chipID):
     """
     Insert variant into psql
     2026/3/17 update
+    2026/3/20 update: separate sample_small_variant to varaint, sample_variant and varirant_consequence,
+                      insert rows by batch_upsert function
     """
     sql = f"""SELECT "sampleSNo" from sample_info where "chipSNo" =  '{chipID}' """
     samples=sqlquery(sql)
@@ -369,124 +402,142 @@ def variant_to_database(result_path,chipID):
                         how='left')
             variant_table['report']= variant_table['report'].astype('boolean').fillna(False)
             variant_table['base__exonno']=variant_table['base__exonno'].astype("Int64") 
-            ## insert rows to psql
-            for i in range(0,variant_table.shape[0]):
-                uniID=f"{sample}_{chipID}"
-                variantID=i
-                uniVID=f"{uniID}_{variantID}"
-                chrom=variant_table['base__chrom'][i]
-                pos=int(variant_table['base__pos'][i])
-                ref=variant_table['base__ref_base'][i]
-                alt=variant_table['base__alt_base'][i]
-                dbsnp=variant_table['dbsnp__rsid'][i]
-                report=bool(variant_table['report'][i])
-                consequence=safe_json_value({
-                    "gene":variant_table['base__hugo'][i],
-                    "transcript":variant_table['base__transcript'][i],
-                    "hgvsc":variant_table['base__cchange'][i],
-                    "hgvsp":variant_table['base__achange'][i],
-                    "exon": safe_json_value(variant_table['base__exonno'][i]),
-                    "sequence_ontology":variant_table['base__so'][i]
-                }) 
-                population={
-                    "gnomad":{
-                        "global":safe_json_value({
-                            "AC":variant_table['gnomad4__ac'][i],
-                            "AN":variant_table['gnomad4__an'][i],
-                            "AF":variant_table['gnomad4__af'][i],
-                            "Homo":variant_table['gnomad4__nhomalt'][i],
-                        }),
-                        "AFR":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_afr'][i],
-                            "AN":variant_table['gnomad4__an_afr'][i],
-                            "AF":variant_table['gnomad4__af_afr'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_afr'][i],
-                        }),
-                        "AMR":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_amr'][i],
-                            "AN":variant_table['gnomad4__an_amr'][i],
-                            "AF":variant_table['gnomad4__af_amr'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_amr'][i],
-                        }),
-                        "EAS":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_eas'][i],
-                            "AN":variant_table['gnomad4__an_eas'][i],
-                            "AF":variant_table['gnomad4__af_eas'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_eas'][i],
-                        }),
-                        "SAS":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_sas'][i],
-                            "AN":variant_table['gnomad4__an_sas'][i],
-                            "AF":variant_table['gnomad4__af_sas'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_sas'][i],
-                        }),
-                        "FIN":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_fin'][i],
-                            "AN":variant_table['gnomad4__an_fin'][i],
-                            "AF":variant_table['gnomad4__af_fin'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_fin'][i],
-                        }),
-                        "NFE":safe_json_value({
-                            "AC":variant_table['gnomad4__ac_nfe'][i],
-                            "AN":variant_table['gnomad4__an_nfe'][i],
-                            "AF":variant_table['gnomad4__af_nfe'][i],
-                            "Homo":variant_table['gnomad4__nhomalt_nfe'][i],
-                        })
-                    }
-                }
-                clinvar=safe_json_value({
-                    "clininical_significance":variant_table['clinvar__sig'][i],
-                    "review_status":variant_table['clinvar__rev_stat'][i],
-                    "clinvar_id":variant_table['clinvar__id'][i],
-                    "significance_detail":variant_table['clinvar__sig_conf'][i],
-                })
-                vcf_info=safe_json_value({
-                    "total_reads":variant_table['vcfinfo__tot_reads'][i],
-                    "alt_reads":variant_table['vcfinfo__alt_reads'][i],
-                    "allele_fraction":variant_table['vcfinfo__af'][i],
-                    "quality":variant_table['vcfinfo__phred'][i],
-                    "zygosity":variant_table['vcfinfo__zygosity'][i],
-                    "filter":variant_table['vcfinfo__filter'][i]
-                })
-                prediction={
-                    "spliceai":safe_json_value({
-                        "score":variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]].max(),
-                        "class":"Pathogenic" if (variant_table.loc[i,variant_table.columns[variant_table.columns.str.contains('spliceai__ds')]]>0.5).any() else None
-                    }),
-                    "dbscsnv_ada":safe_json_value({
-                        "score":variant_table['dbscsnv__ada_score'][i],
-                        "class":"Pathogenic" if variant_table['dbscsnv__ada_score'][i]>0.7 else None
-                    }),
-                    "revel":safe_json_value({
-                        "score":variant_table['revel__rankscore'][i],
-                        "class":f"Pathogenic_{variant_table['revel__pp3_pathogenic'][i]}" if pd.notna(variant_table['revel__pp3_pathogenic'][i]) else None
-                    }),
-                    "vest4":safe_json_value({
-                        "score":variant_table['vest__score'][i],
-                        "class":f"Pathogenic_{variant_table['vest__pp3_pathogenic'][i]}" if pd.notna(variant_table['vest__pp3_pathogenic'][i]) else None
-                    })
-                }
-                sqlexe(
-                    """
-                    INSERT INTO sample_small_variant ("UniVID", "UniID", "variantID", "chrom", "pos","ref_base","alt_base","dbsnp","report","consequence","population","clinvar","vcf_info","prediction")
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT ("UniVID") DO NOTHING
-                    """,
-                    [uniVID, uniID, variantID, chrom, pos, ref, alt, dbsnp, report, json.dumps(consequence), json.dumps(population), 
-                    json.dumps(clinvar),json.dumps(vcf_info),json.dumps(prediction)]
+            
+            ## insert rows to database
+            variant_cache = {}
+            sample_variant_rows = []
+            consequence_rows= []
+            print(variant_table.shape)
+            for _, row in variant_table.iterrows():
+                row_dict=row.to_dict()
+                row_dict=safe_json_value(row_dict)
+                chrom=row_dict['base__chrom']
+                pos=int(row_dict['base__pos'])
+                ref_base=row_dict['base__ref_base']
+                alt_base=row_dict['base__alt_base']
+
+                key = (chrom, pos, ref_base, alt_base)
+                
+
+                if key not in variant_cache:
+                    ## upsert rows to variant table and get variant_id
+                    variant_id=sqlexe("""
+                            INSERT INTO variant (chrom, pos, ref_base, alt_base)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (chrom, pos, ref_base, alt_base)
+                            DO NOTHING
+                            RETURNING variant_id;
+                            """, 
+                            [chrom, pos, ref_base, alt_base],True)
+                variant_cache[key]=variant_id
+                variant_id=variant_cache[key]
+                
+                ## collect rows for sample_variant and consequence
+                sample_id = f"{sample}_{chipID}"
+                
+                sample_variant_rows.append((
+                   sample_id,variant_id,row_dict['vcfinfo__zygosity'],row_dict['vcfinfo__tot_reads'],row_dict['vcfinfo__alt_reads'],row_dict['vcfinfo__filter'],row_dict['vcfinfo__phred'],
+                     row_dict['extra_vcf_info__FS'],row_dict['extra_vcf_info__QD'],row_dict['extra_vcf_info__SOR'],row_dict['extra_vcf_info__MQ'],row_dict['extra_vcf_info__MQRankSum'],row_dict['extra_vcf_info__ReadPosRankSum'],
+                     bool(row_dict['report'])
+                ))
+
+                consequence_rows.append((
+                    variant_id,row_dict['base__hugo'],row_dict['base__transcript'],row_dict['base__exonno'],row_dict['base__cchange'],row_dict['base__achange'],row_dict['base__so'],"ENSEMBL"
+                ))
+
+            ## batch upsert rows to sample_variant table    
+            batch_upsert(
+                """
+                INSERT INTO sample_variant (
+                    sample_id, variant_id, genotype, total_reads, alt_reads,
+                    filter, quality, FS, QD, SOR, MQ, MQRankSum, ReadPosRankSum, report
                 )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (sample_id, variant_id) DO NOTHING;
+                """,
+                sample_variant_rows
+            )
+
+            batch_upsert(
+                """
+                INSERT INTO variant_consequence (
+                    variant_id, gene, transcript, exon, hgvsc, hgvsp, impact, source
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (variant_id, transcript, source) DO NOTHING;
+                """,
+                consequence_rows
+            )
+            print(len(variant_cache))
             print(f"Completed!")
         else:
             print(f"no analytic result is found for sample {sample}")
             
-    
-        
+####抓資料庫版本
+TOP_TITLE_RE = re.compile(r'^title\s*:\s*(.+?)\s*$')
+TOP_VERSION_RE = re.compile(r'^version\s*:\s*(.+?)\s*$')
 
+def read_text(path: str) -> List[str]:
+    """以 UTF-8 讀取檔案，回退 errors='replace'，回傳行清單。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()
+    except UnicodeDecodeError:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()
 
-            
+def extract_top_level_title_version(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    只擷取「行首（無縮排）」的 title/version。
+    - 跳過空行與以 # 開頭的註解行。
+    - 去除包覆的單/雙引號。
+    - 只取第一個匹配到的值。
+    """
+    title = None
+    version = None
+    for line in read_text(path):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if line[:1].isspace():
+            continue
+        if title is None:
+            m = TOP_TITLE_RE.match(line)
+            if m:
+                val = m.group(1).strip()
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                title = val
+        if version is None:
+            m = TOP_VERSION_RE.match(line)
+            if m:
+                val = m.group(1).strip()
+                if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                    val = val[1:-1]
+                version = val
+        if title is not None and version is not None:
+            break
+    return title, version
 
-
-
+def scan_yaml_files(base_dir: str):
+    """
+    base_dir 下所有 .yml/.yaml 檔，回傳結果清單。
+    每筆包含：module(父資料夾名), file(檔名), title, version, path(完整路徑)
+    """
+    results = []
+    for root, _, files in os.walk(base_dir):
+        for fn in files:
+            if not fn.lower().endswith((".yml", ".yaml")):
+                continue
+            full = os.path.join(root, fn)
+            module = os.path.basename(os.path.dirname(full))
+            title, version = extract_top_level_title_version(full)
+            results.append({
+                "title": title if title else "N/A",
+                "version": version if version else "N/A",
+            })
+    results.sort(key=lambda r: (r["title"].lower()))
+    return results
 
 #########################################API####################################################
 ## WESCoreAnalysis Section
@@ -511,7 +562,7 @@ def coreanalysis(request):
             return JsonResponse({"Code":500, "Msg":"Error found on server"})
 
         # Datatable niptcoreanalysis
-        sql = """select * from wescoreanalysis"""
+        sql = """select "testidx","sampleSNo","chipSNo","sex","mean_target_coverage" AS "meanTargetCoverage", "10x" AS "pctOver10x", "QC_pass", "report_variant_count" AS "reportSmallVariantCount", "sequencingDate", "analysisTime", "status" from wescoreanalysis"""
         twes = sqlquery(sql)
 
         # Filter by item
@@ -525,8 +576,8 @@ def coreanalysis(request):
             tnipt = tnipt[tnipt['specimenNumber'] == findspecimen]
         '''
         # Filter by sample (用前9碼去對應)
-        if len(findsample) != 0:
-            twes=twes[twes['sampleSNo'].str.contains(findsample)]
+        if len(findspecimen) != 0:
+            twes=twes[twes['sampleSNo'].str.contains(findspecimen)]
             '''
             if findsample.startswith("PC"):
                 # PC → 前 6 碼
@@ -546,11 +597,11 @@ def coreanalysis(request):
         # Filter by time
         if len(findstarttime) != 0:
             starttime = pd.to_datetime(findstarttime)
-            tnipt = tnipt[tnipt['sequencingDate'] >= starttime]
+            twes = twes[twes['sequencingDate'] >= starttime]
 
         if len(findendtime) != 0:
             endtime = pd.to_datetime(findendtime)
-            tnipt = tnipt[tnipt['sequencingDate'] <= endtime]
+            twes = twes[twes['sequencingDate'] <= endtime]
 
         # Filter by detail
         '''
@@ -568,11 +619,13 @@ def coreanalysis(request):
         twes = twes.fillna("-")
         twes = twes.replace('nan', '-').replace('', '-')
         #tnipt["NIPTTestResults"] = tnipt["NIPTTestResults"].replace('-', '低風險')
-        twes["NIPTTestResults"] = twes["report_variant_count"]
+        #twes["NIPTTestResults"] = twes["report_variant_count"]
+        twes['originalQualityControl'] = twes['QC_pass'].apply(lambda x: "PASS" if x is True else "FAIL")
         twes = convertTime(twes, 'sequencingDate')
         twes = convertTime(twes, 'analysisTime')
         core_table = twes.to_json(orient='records')
         core_table = json.loads(core_table)
+        print(core_table)
         return JsonResponse({"Code":200, "Msg":{'user_id':userid, 'core_table':core_table}})
     except:
         return JsonResponse({"Code":500, "Msg": "No data found"})
@@ -607,19 +660,23 @@ def coreanalysis_detail(request):
     sampleid = request.POST['sampleSNo']
     chipid = request.POST['chipSNo']
 
+    print([userid,sampleid,chipid])
+
     if userid is None:
         return JsonResponse({"Code":500, "Msg":"Error found on server"})
     
     T03sql = f"""SELECT chrom, pos, ref_base, alt_base, 
-        consequence->>gene as gene,
-        consequence->>hgvsc as hgvsc,
-        consequence->>hgvsp as hgvsp,
-        consequence->>transcript as transcript,
-        consequence->>transcript as transcript,
-                        from sample_small_variant where "UniID" = '{sampleid}_{chipid}'"""
+        (consequence->>'gene') AS gene,
+        (consequence->>'hgvsc') AS hgvsc,
+        (consequence->>'hgvsp') AS hgvsp,
+        (consequence->>'transcript') AS transcript
+        FROM sample_small_variant WHERE "UniID" = '{sampleid}_{chipid}' and report=True"""
     T03all= sqlquery(T03sql)
     T03all = T03all.apply(lambda x: float(x) if isinstance(x, Decimal) else x)
+    print("...")
+    print(T03all.to_json(orient='records'))
 
+    '''
     # Sample info section
     ## section 1
     niptSample1 = T03all[['sampleSNo','pregnantName', "redrawBlood"]]
@@ -644,12 +701,12 @@ def coreanalysis_detail(request):
         othersamplesdf = othersamples['UID']
         othersamplesdf = othersamplesdf.tolist()
     niptSample1['otherSampleSNoList'] = othersamplesdf
-
+    
     # Quality info section
     ## section 1: QC summary
-    niptQC1 = T03all[['sampleSNo','chipSNo','originalQualityControl','qualified']]
+    niptQC1 = T03all[['sampleSNo','chipSNo','originalQualityControl','mean_target_coverage','10x']]
     niptQC1 = {k: v[0] for k, v in niptQC1.to_dict(orient='list').items()}
-    allpass = T03all['qualified'].values[0]
+    allpass = T03all['QC_pass'].values[0]
 
     ## section2: QC detail (lack of FCPercent)
     niptQC2 = T03all.drop(['sampleSNo','chipSNo'],axis=1)
@@ -822,8 +879,8 @@ def coreanalysis_detail(request):
              "quality_info":{"section1":niptQC1, "section2":niptQC2}, 
              "analysis_info":{"section1":niptR1, "section2":niptR2, "section3":niptR3, "section4":niptR4, "section5":niptR5}, 
              "cnv_info":{"section1":niptR6,"section2":chromosome_dict}}        
-
-    return JsonResponse({"Code":200, "Msg":final})
+'''
+    return JsonResponse({"Code":200, "Msg":"test"})
 
 ## Management Section
 ### API-C01
@@ -1055,28 +1112,41 @@ def chip_sampleDetail(request):
     chipdf = sqlquery(csql)
     if chipdf.shape[0] != 1:
         return JsonResponse({"Code":500, "Msg":"並已無此晶片紀錄，請重新整理頁面或者通知管理人員!"})
+    status = chipdf.iloc[0]["status"]
+    if status == '檢測分析已完成':
+        sql = """
+        SELECT
+            s."testidx",
+            s."sampleSNo",
+            s."chipSNo",
+            s."status",
+            q."sex",
+            q."input_reads",
+            q."10x",
+            q."mean_target_coverage",
+            q."uniformity_of_coverage",
+            q."aligned_reads" as "aligned reads",
+            q."aligned",
+            q."enrichment",
+            q."padded_enrichment" as "meanpadded_enrichment"
+        FROM "sample_info" AS s
+        JOIN "QCanalysis" AS q
+        ON q."UniID" = s."UniID"   -- 以 UniID 對齊，最安全不會錯位
+        WHERE s."chipSNo" = %s
+        ORDER BY s."testidx" ASC;
+        """
+    else:
+        sql = """
+        SELECT
+            "testidx",
+            "sampleSNo",
+            "chipSNo",
+            "status"
+        FROM "sample_info"
+        WHERE "chipSNo" = %s
+        ORDER BY "testidx" ASC;
+        """
     
-    sql = """
-    SELECT
-        s."testidx",
-        s."sampleSNo",
-        s."chipSNo",
-        s."status",
-        q."sex",
-        q."input_reads",
-        q."10x",
-        q."mean_target_coverage",
-        q."uniformity_of_coverage",
-        q."aligned_reads",
-        q."aligned",
-        q."enrichment",
-        q."padded_enrichment"
-    FROM "sample_info" AS s
-    JOIN "QCanalysis" AS q
-    ON q."UniID" = s."UniID"   -- 以 UniID 對齊，最安全不會錯位
-    WHERE s."chipSNo" = %s
-    ORDER BY s."testidx" ASC;
-    """
     dfs = sqlquery(sql, [chipid])
     dfs = dfs.fillna("")
     dftmp = dfs.to_json(orient='records')
@@ -1447,7 +1517,11 @@ def addversion(request):
     version = request.POST['verSNo']
     content = request.POST['content']
     try:
-        sqlexe(f"""INSERT INTO "wesversion" ("vid", "content") VALUES (%s, %s)""", [version, content])
+        items = scan_yaml_files(annotators_path)
+        db_version = "; ".join([f'{it["title"]}-{it["version"]}' for it in items])
+        if db_version:
+            db_version += ";"
+        sqlexe('INSERT INTO "wesversion" ("vid", "content", "db_version") VALUES (%s, %s, %s)',[version, content, db_version])
         return JsonResponse({"Code":200, "Msg":f"""你的版號第{version}號已經更新到系統上了，頁面請重新整理!"""})
     except:
         return JsonResponse({"Code":500, "Msg":"更新失敗!"})
