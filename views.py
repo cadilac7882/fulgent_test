@@ -136,14 +136,6 @@ def sample_qc_to_database(result_path):
     for index, row in sampleqc_df.iterrows():
         data = tuple(map(str, row))
         sqlexe(sql, data)
-        
-def process_result_summary(result_path, chipid):
-    sql = f"""UPDATE "sample_info" SET "status" = %s WHERE "chipSNo" = %s"""
-    sqlexe(sql, ["分析完成", chipid])
-    run_qc_to_database(result_path)
-    sample_qc_to_database(result_path)
-    variant_to_database(result_path,chipid)
-    import_to_database(result_path)
 
 def check_run_completion(folder_path: str) -> bool:
     """
@@ -162,9 +154,12 @@ def check_run_completion(folder_path: str) -> bool:
 
     return False
 
-def update_chip_info(chipid, status):
-    chipsql = f"""UPDATE "chip_info" SET "status" = %s WHERE "chipSNo" = %s"""
-    sqlexe(chipsql, [status, chipid])
+def update_status(table: str, chipid: str, status: str):
+    """
+    Update status by chipSNo for chip_info or sample_info
+    """
+    sql = f'''UPDATE "{table}" SET "status" = %s WHERE "chipSNo" = %s'''
+    sqlexe(sql, [status, chipid])
 
 def sending_mail_fail(chipid,output_path):
     subject = '[通知]WES Nextflow 分析失敗'
@@ -201,14 +196,16 @@ def get_sequencing_info(chipid):
         if folder_chipid != chipid:
             continue
         folder_path = os.path.join(NS2000_path, folder_name)
-        
+
         # 先確認 CopyComplete.txt
         if not check_run_completion(folder_path):
             print(f"{chipid} sequencing not finish!!")
             return sequencing_date, [], 0
 
         # 讀 SampleSheet
-        sample_sheet_path = os.path.join(folder_path, "SampleSheet.csv")
+        # sample_sheet_path = os.path.join(folder_path, "SampleSheet.csv")
+        matches = glob.glob(os.path.join(folder_path, "**", "SampleSheet.csv"), recursive=True)
+        sample_sheet_path = matches[0] if matches else None
         sample_ids = []
         if os.path.exists(sample_sheet_path):
             with open(sample_sheet_path, "r", encoding="utf-8") as f:
@@ -251,22 +248,25 @@ def sync_created_chip(chipid):
          WHERE "chipSNo"      = %s
            AND "status"       = '晶片已創建'
         """,
-        [sequencingDate, sampleSize, "準備分析", True, chipid]
+        [sequencingDate, samplesize, "準備分析", True, chipid]
     )
 
     # 2) 匯入 sample_info（避免重複）
-    # 需要資料庫上有唯一鍵 ("sampleid","chipSNo")
     for sample in samplelist:
+        UniID = f"{sample}_{chipid}"
         sqlexe(
             """
-            INSERT INTO sample_info ("sampleid","chipSNo","status")
-            VALUES (%s,%s,%s)
-            ON CONFLICT ("sampleid","chipSNo") DO NOTHING
+            INSERT INTO sample_info ("UniID","sampleSNo","chipSNo","status")
+            VALUES (%s,%s,%s,%s)
+            ON CONFLICT ("UniID") DO NOTHING
             """,
-            [sample, chipid, "待分析"]
+            [UniID, sample, chipid, "待分析"]
         )
 
 def check_chip_status():
+    '''
+    3/25 update check trace.txt & database.txt 
+    '''
     sql = f"""select * from "chip_info" """
     chipdf = sqlquery(sql)
 
@@ -279,7 +279,7 @@ def check_chip_status():
         except Exception as e:
             pass
     
-    # ---------- (B) 再處理「檢測分析進行中」→ 根據 trace 決定後續 ----------
+    # ---------- (B) 再處理「檢測分析進行中」→ 根據 trace & database 決定後續 ----------
     in_progress_df = chipdf[chipdf['status'] == '檢測分析進行中']
     for index, row in in_progress_df.iterrows():
         chipid=row['chipSNo']
@@ -287,31 +287,57 @@ def check_chip_status():
         tmp_analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "tmp", "analysis", analysisfolder)
         output_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
         if not os.path.isdir(tmp_analysis_path) and not os.path.isdir(output_path):
-            update_chip_info(chipid, '準備分析')
+            update_status("chip_info", chipid, '準備分析')
             continue
         if os.path.isdir(tmp_analysis_path):
             continue
         if not os.path.isdir(output_path):
             continue
-        trace_path = os.path.join(output_path,"trace.txt")
-        if trace_path and os.path.exists(trace_path):
+
+        trace_path = os.path.join(output_path, "trace.txt")
+        database_path = os.path.join(output_path, "database.txt")
+        all_completed = False
+        if os.path.exists(trace_path):
             tracedf = pd.read_csv(trace_path, sep="\t")
-            status_list = tracedf['status'].tolist()
-            if len(status_list)!=0:
-                all_completed = all(status == 'COMPLETED' for status in status_list)
-            else:
-                all_completed = False
+            status_list = tracedf["status"].tolist()
+            if status_list:
+                all_completed = all(status == "COMPLETED" for status in status_list)
+        all_completed = all_completed and os.path.exists(database_path)
+
+        # ---------- 更新狀態 ----------
+        if all_completed:
+            # 更新 chip / sample 狀態
+            update_status("chip_info", chipid, "檢測分析已完成")
+            update_status("sample_info", chipid, "分析完成")
         else:
-            all_completed = False
-        if all_completed: 
-            #更新chipid狀態
-            update_chip_info(chipid, '檢測分析已完成')
-            process_result_summary(output_path, chipid)
-        else:
-            #更新chipid狀態
-            update_chip_info(chipid, '準備分析')
+            update_status("chip_info", chipid, "準備分析")
             # 發送郵件通知分析失敗
             sending_mail_fail(chipid, output_path)
+
+    in_progress_df = chipdf[chipdf['status'] == '重跑分析進行中']
+    for index, row in in_progress_df.iterrows():
+        chipid=row['chipSNo']
+        analysisfolder=row['analysisfolder']
+        output_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
+        trace_path = os.path.join(output_path, "trace2.txt")
+        all_completed = False
+        has_fail = False
+        if os.path.exists(trace_path):
+            tracedf = pd.read_csv(trace_path, sep="\t")
+            status_list = tracedf["status"].tolist()
+            if status_list:
+                completed_count = status_list.count("COMPLETED")
+                all_completed = all(status == "COMPLETED" for status in status_list)
+                has_fail = any(status == "FAILED" for status in status_list)
+        # ---------- 更新狀態 ----------
+        if all_completed:
+            if completed_count==2:
+                update_status("chip_info", chipid, "檢測分析已完成")
+        elif has_fail:
+            update_status("chip_info", chipid, "準備分析")
+            sending_mail_fail(chipid, output_path)
+        else:
+            pass
 
 def pad(text):
     return text + (16 - len(text) % 16) * ' '
@@ -340,11 +366,11 @@ def safe_decrypt(x):
     except Exception as e:
         return x 
 
-
 def safe_json_value(val):
     """
     處理存進josn中的NaN 
     2026/3/20 update: deal with bool
+    2026/3/25 update:  add nan & Decimal
     """
     if isinstance(val, dict):
         return {k: safe_json_value(v) for k, v in val.items()}
@@ -358,6 +384,10 @@ def safe_json_value(val):
         return float(val)
     if isinstance(val, (np.integer, int)):
         return int(val)
+    if str(val).lower() == 'nan':
+        return "-"
+    if isinstance(val, Decimal):
+        return float(val)
     return val
 
 def batch_upsert(
@@ -382,8 +412,8 @@ def variant_to_database(result_path,chipID):
     """
     Insert variant into psql
     2026/3/17 update
-    2026/3/20 update: separate sample_small_variant to varaint, sample_variant and varirant_consequence,
-                      insert rows by batch_upsert function
+    2026/3/20 update: separate sample_small_variant to varaint, sample_variant and varirant_consequence,insert rows by batch_upsert function
+    2026/3/23 update: alter insertion query for sample_variant and variant
     """
     sql = f"""SELECT "sampleSNo" from sample_info where "chipSNo" =  '{chipID}' """
     samples=sqlquery(sql)
@@ -483,6 +513,200 @@ def variant_to_database(result_path,chipID):
             print(f"Completed!")
         else:
             print(f"no analytic result is found for sample {sample}")
+
+def cnv_to_database(result_path,chipID):
+    """2026/3/30
+    Insert cnv into psql
+    """
+    sql = f"""SELECT "sampleSNo" from sample_info where "chipSNo" =  '{chipID}' """
+    samples=sqlquery(sql)
+    for sample in samples['sampleSNo']:
+        ## 讀取opencravat註解結果 (sqlite)
+        print(f"load variant for sample {sample}")
+        if(os.path.exists(f"{result_path}/{sample}")):
+            variant_table=pd.read_table(f"{result_path}/{sample}/AnnotSV/{sample}.cnv.tsv",sep='\t')
+            variant_table=variant_table[variant_table['Annotation_mode']=='split']
+            variant_table['SV_chrom']=variant_table['SV_chrom'].astype(str)
+
+            ## 讀取inhouse-filteration的結果 (xlsx)
+            filtered_table=pd.read_excel(f"{result_path}/{sample}/{sample}_filtered.xlsx",sheet_name='CNV')
+            filtered_table=filtered_table[['SV_chrom','SV_start','SV_end']]
+            filtered_table['SV_chrom']=filtered_table['SV_chrom'].astype(str)
+
+            ## 合併兩表並以report欄位標示是否為篩選結果
+            variant_table=variant_table.merge(filtered_table.assign(report=True),
+                        on=['SV_chrom','SV_start','SV_end'],
+                        how='left')
+            variant_table['report']= variant_table['report'].astype('boolean').fillna(False)
+            
+            ## 切割vcf information
+            variant_table[['GT', 'SM', 'CN', 'BC', 'PE']] = (
+                variant_table[variant_table['Samples_ID'].iloc[0]]
+                .str.split(':', expand=True)
+            )
+            variant_table['CN'] = pd.to_numeric(variant_table['CN'], errors='coerce').astype('Int64')
+            variant_table['BC'] = pd.to_numeric(variant_table['BC'], errors='coerce').astype('Int64')
+            variant_table['SM'] = pd.to_numeric(variant_table['SM'], errors='coerce')
+            variant_table['GT']=variant_table['GT'].map({
+                '0/1':'het',
+                '1/1':'hom',
+                './1':'unknown'
+            })
+
+            ## combine trascript id
+            variant_table['transcript']=variant_table['Tx'].astype(str) + '.' + variant_table['Tx_version'].astype(int).astype(str)
+
+            ## 計算affect exons
+            variant_table[['exons', 'affect_exons']] = variant_table.apply(
+                lambda x: pd.Series(
+                    count_exons(x['Location'], x['Exon_count']),
+                    index=['exons', 'affect_exons']
+                ),
+                axis=1
+            )
+
+            ## 強制讓chrom中包含chr  
+            variant_table['SV_chrom'] = variant_table['SV_chrom'].where(
+                variant_table['SV_chrom'].str.startswith('chr'),
+                'chr' + variant_table['SV_chrom']
+            )
+
+            ## insert rows to database
+            variant_cache = {}
+            sample_variant_rows = []
+            consequence_rows= []
+            for _, row in variant_table.iterrows():
+                row_dict=row.to_dict()
+                row_dict=safe_json_value(row_dict)
+                chrom    =row_dict['SV_chrom']
+                start_pos=int(row_dict['SV_start'])
+                end_pos  =int(row_dict['SV_end'])
+                cn_type  =row_dict['SV_type']
+
+                key = (chrom, start_pos, end_pos, cn_type)
+                
+
+                if key not in variant_cache:
+                    ## upsert rows to variant table and get variant_id
+                    variant_id=sqlexe("""
+                            INSERT INTO cnv (chrom, start_pos, end_pos, cn_type)
+                            VALUES (%s, %s, %s, %s)
+                            ON CONFLICT (chrom, start_pos, end_pos, cn_type)
+                            DO UPDATE SET chrom = EXCLUDED.chrom
+                            RETURNING variant_id;
+                            """, 
+                            [chrom, start_pos, end_pos, cn_type],True)
+                variant_cache[key]=variant_id
+                variant_id=variant_cache[key]
+                
+                ## collect rows for sample_variant and consequence
+                sample_id = f"{sample}_{chipID}"
+                
+                sample_variant_rows.append((
+                   sample_id,variant_id,row_dict['GT'],row_dict['FILTER'],row_dict['QUAL'],row_dict['CN'],row_dict['SM'],
+                     row_dict['BC'],bool(row_dict['report']
+                )))
+
+                consequence_rows.append((
+                    variant_id,row_dict['Gene_name'],row_dict['transcript'],row_dict['exons'],row_dict['affect_exons'],"RefSeq"
+                ))
+
+            ## batch upsert rows to sample_variant table    
+            batch_upsert(
+                """
+                INSERT INTO sample_cnv (
+                    sample_id, variant_id, genotype, filter, quality, cn, sm, bc, report
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (sample_id, variant_id) DO UPDATE 
+                SET
+                    genotype       = EXCLUDED.genotype,
+                    filter         = EXCLUDED.filter, 
+                    quality        = EXCLUDED.quality, 
+                    cn             = EXCLUDED.cn, 
+                    sm             = EXCLUDED.sm, 
+                    bc             = EXCLUDED.bc,
+                    report         = EXCLUDED.report;
+                """,
+                sample_variant_rows
+            )
+
+            batch_upsert(
+                """
+                INSERT INTO cnv_consequence (
+                    variant_id, gene, transcript, exons, affect_exons, source
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING;
+                """,
+                consequence_rows
+            )
+            print(f"Completed!")
+        else:
+            print(f"no analytic result is found for sample {sample}")
+
+def count_exons(region, total_exons=None):
+    """2026/3/30
+    Count the number of exons overlapped by a genomic region.
+
+    Parameters
+    ----------
+    region : str
+        Region string, e.g. "exon3-exon5", "intron6-exon8", "txStart-exon3"
+    total_exons : int, optional
+        Total number of exons in the gene (required if txEnd is used)
+
+    Returns
+    -------
+    tuple
+        (number_of_exons, affected_exon_label)
+    """
+
+    region = region.lower()
+
+    # txStart-txEnd => full gene
+    if region == "txstart-txend":
+        if total_exons is None:
+            raise ValueError("total_exons must be provided for txStart-txEnd")
+        return total_exons, "Full gene"
+
+    left, right = region.split("-")
+
+    def get_num(s):
+        nums = re.sub(r"[^0-9]", "", s)
+        return int(nums) if nums else None
+
+    # left boundary
+    if left.startswith("exon"):
+        start_exon = get_num(left)
+    elif left.startswith("intron"):
+        start_exon = get_num(left) + 1
+    elif left == "txstart":
+        start_exon = 1
+    else:
+        raise ValueError(f"Invalid left boundary: {left}")
+
+    # right boundary
+    if right.startswith("exon"):
+        end_exon = get_num(right)
+    elif right.startswith("intron"):
+        end_exon = get_num(right)
+    elif right == "txend":
+        if total_exons is None:
+            raise ValueError("total_exons must be provided when using txEnd")
+        end_exon = total_exons
+    else:
+        raise ValueError(f"Invalid right boundary: {right}")
+
+    # calculate
+    if end_exon < start_exon:
+        return 0, "No exon"
+    elif end_exon == start_exon:
+        return 1, f"Exon{start_exon}"
+    elif total_exons is not None and (end_exon - start_exon + 1) == total_exons:
+        return total_exons, "Full gene"
+    else:
+        return end_exon - start_exon + 1, f"Exon{start_exon}-{end_exon}"
             
 ####抓資料庫版本
 TOP_TITLE_RE = re.compile(r'^title\s*:\s*(.+?)\s*$')
@@ -550,6 +774,14 @@ def scan_yaml_files(base_dir: str):
     results.sort(key=lambda r: (r["title"].lower()))
     return results
 
+def get_latest_vid():
+    sql = ''' SELECT vid FROM wesversion ORDER BY "updateTime" DESC LIMIT 1'''
+    df = sqlquery(sql)
+    if df is None or df.empty:
+        return None
+    return df.iloc[0]['vid']
+
+
 #########################################API####################################################
 ## WESCoreAnalysis Section
 ### API-T01
@@ -560,46 +792,20 @@ def coreanalysis(request):
     # Get filter metadata
     try:
         userid = request.POST['userid']
-        finditem = request.POST['finditem']
-        findspecimen = request.POST['findspecimen']
         findsample = request.POST['findsample']
-        findchip = request.POST['findchip']
+        findchip = request.POST['findchipSNo']
         findstarttime = request.POST['findstarttime']
         findendtime = request.POST['findendtime']
-        finderrortype = request.POST['finderrortype']
-        finddetail = request.POST['finddetail']
-
         if userid is None:
             return JsonResponse({"Code":500, "Msg":"Error found on server"})
 
-        # Datatable niptcoreanalysis
-        sql = """select "testidx","sampleSNo","chipSNo","sex","mean_target_coverage" AS "meanTargetCoverage", "10x" AS "pctOver10x", "QC_pass", "report_variant_count" AS "reportSmallVariantCount", "sequencingDate", "analysisTime", "status" from wescoreanalysis"""
+        # Datatable wescoreanalysis
+        sql = """select "testidx","sampleSNo","chipSNo","sex","mean_target_coverage" AS "meanTargetCoverage", "10x" AS "pctOver10x", "QC_pass", "report_variant_count" AS "reportSmallVariantCount","report_cnv_count" AS "reportCNVCount", "sequencingDate", "analysisTime", "status" from wescoreanalysis"""
         twes = sqlquery(sql)
 
-        # Filter by item
-        '''
-        if finditem != '全部':
-            tnipt = tnipt[tnipt['testItem'] == finditem]
-        '''
-        # Filter by specimen
-        '''
-        if len(findspecimen) != 0:
-            tnipt = tnipt[tnipt['specimenNumber'] == findspecimen]
-        '''
-        # Filter by sample (用前9碼去對應)
-        if len(findspecimen) != 0:
-            twes=twes[twes['sampleSNo'].str.contains(findspecimen)]
-            '''
-            if findsample.startswith("PC"):
-                # PC → 前 6 碼
-                tnipt = tnipt[tnipt['sampleSNo'].str[:6] == findsample[:6]]
-            # elif findsample.startswith("NC"):
-            #     # NC → 前 7 碼
-            #     tnipt = tnipt[tnipt['sampleSNo'].str[:9] == findsample[:9]]
-            else:
-                # 其他 → 前 9 碼
-                tnipt = tnipt[tnipt['sampleSNo'].str[:9] == findsample[:9]]
-            '''
+        # Filter by sample
+        if len(findsample) != 0:
+            twes=twes[twes['sampleSNo'].str.contains(findsample)]
 
         # Filter by chip
         if len(findchip) != 0:
@@ -614,29 +820,16 @@ def coreanalysis(request):
             endtime = pd.to_datetime(findendtime)
             twes = twes[twes['sequencingDate'] <= endtime]
 
-        # Filter by detail
-        '''
-        if finddetail != '全部':
-            tnipt = tnipt[tnipt['testDetail'] == finddetail]
-        '''
-        # Filter by detail
-        '''
-        if finderrortype != '無':
-            tnipt =  tnipt[tnipt['redrawBlood'] == finderrortype]
-        '''
         ## output
-        #tnipt["totalRds"] = tnipt["totalRds"].apply(lambda x: f'{x:,}')
-        #tnipt["uniMapRds"] = tnipt["uniMapRds"].apply(lambda x: f'{x:,}')
         twes = twes.fillna("-")
         twes = twes.replace('nan', '-').replace('', '-')
-        #tnipt["NIPTTestResults"] = tnipt["NIPTTestResults"].replace('-', '低風險')
-        #twes["NIPTTestResults"] = twes["report_variant_count"]
         twes['originalQualityControl'] = twes['QC_pass'].apply(lambda x: "PASS" if x is True else "FAIL")
         twes = convertTime(twes, 'sequencingDate')
         twes = convertTime(twes, 'analysisTime')
+        twes['reportSmallVariantCount']="SNV:"+twes['reportSmallVariantCount'].astype('str')+"\nCNV:"+twes['reportCNVCount'].astype('str')
         core_table = twes.to_json(orient='records')
         core_table = json.loads(core_table)
-        print(core_table)
+        #print(core_table)
         return JsonResponse({"Code":200, "Msg":{'user_id':userid, 'core_table':core_table}})
     except:
         return JsonResponse({"Code":500, "Msg": "No data found"})
@@ -646,21 +839,17 @@ def coreanalysis_download(request):
     list_testidx = request.POST['list_testidx']
     corelist = json.loads(list_testidx)
 
-    sql = """SELECT * FROM niptcoreanalysis"""
+    sql = """SELECT * FROM wescoreanalysis"""
     coredf = sqlquery(sql)
     coredf = coredf.loc[:, ~coredf.columns.duplicated()]
     coredf = coredf.drop(columns=["UniID"])
     tnipt = coredf[coredf["testidx"].isin(corelist)]
 
-    #下載頁面模板中的coreanalysis_selected_cols，轉換成中文
-    sql = """select "coreanalysis_selected_cols","coreanalysis_cols" from download_cols"""
-    tnipt = download_and_convert(sql,tnipt, ['coreanalysis_selected_cols', 'coreanalysis_cols'])
-
     ## Make file
     now = datetime.now()
-    output_name = f"niptINFO_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
-    outpath = os.path.join(settings.BASE_DIR, 'nipt/static/tmp/niptdata', output_name)
-    filepath = os.path.join('/static/tmp/niptdata', output_name)
+    output_name = f"wesINFO_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
+    outpath = os.path.join(settings.BASE_DIR, 'wes/static/tmp/wesdata', output_name)
+    filepath = os.path.join('/static/tmp/wesdata', output_name)
     tnipt.to_excel(outpath, index=False)
 
     return JsonResponse({"Code":200, "Msg":{"core_durl":filepath}})
@@ -670,228 +859,133 @@ def coreanalysis_detail(request):
     userid = request.POST['user_id']
     sampleid = request.POST['sampleSNo']
     chipid = request.POST['chipSNo']
-
     print([userid,sampleid,chipid])
 
     if userid is None:
         return JsonResponse({"Code":500, "Msg":"Error found on server"})
-    
-    T03sql = f"""SELECT chrom, pos, ref_base, alt_base, 
-        (consequence->>'gene') AS gene,
-        (consequence->>'hgvsc') AS hgvsc,
-        (consequence->>'hgvsp') AS hgvsp,
-        (consequence->>'transcript') AS transcript
-        FROM sample_small_variant WHERE "UniID" = '{sampleid}_{chipid}' and report=True"""
-    T03all= sqlquery(T03sql)
-    T03all = T03all.apply(lambda x: float(x) if isinstance(x, Decimal) else x)
-    print("...")
-    print(T03all.to_json(orient='records'))
 
-    '''
-    # Sample info section
-    ## section 1
-    niptSample1 = T03all[['sampleSNo','pregnantName', "redrawBlood"]]
-    niptSample1 = {k: v[0] for k, v in niptSample1.to_dict(orient='list').items()}
-
-    ## section2
-    niptSample2 = T03all[['sampleSNo','pregnantName', "bloodCollectionTime", "identifyNo", "pregnantAge", "testItem", "testDetail", "specimenNumber", "analysisTime"]]
-    niptSample2 = niptSample2.apply(lambda x: float(x) if isinstance(x, Decimal) else x)
-    niptSample2['identifyNo'] = niptSample2['identifyNo'].apply(safe_decrypt)
-    niptSample2 = convertTime(niptSample2, 'bloodCollectionTime')
-    niptSample2 = convertTime(niptSample2, 'analysisTime')
-    niptSample2 = {k: v[0] for k, v in niptSample2.to_dict(orient='list').items()}
-
-    ### Check other sample with the same specimen
-    specimenNumber = niptSample2['specimenNumber']
-    othersql = f"""select "sampleSNo", "chipSNo" from "niptcoreanalysis" where "specimenNumber" = '{specimenNumber}' AND "sampleSNo" != '{sampleid}' """
-    othersamples = sqlquery(othersql)
-    if othersamples.empty:
-        othersamplesdf = []
-    else:
-        othersamples['UID'] = othersamples['sampleSNo'] + '_' + othersamples['chipSNo']
-        othersamplesdf = othersamples['UID']
-        othersamplesdf = othersamplesdf.tolist()
-    niptSample1['otherSampleSNoList'] = othersamplesdf
-    
+    sql = """
+        SELECT
+            "sampleSNo",
+            "chipSNo",
+            "sex",
+            "mean_target_coverage",
+            "10x",
+            "QC_pass",
+            "input_reads",
+            "uniformity_of_coverage",
+            "aligned_reads",
+            "aligned",
+            "enrichment",
+            "padded_enrichment"
+        FROM wescoreanalysis
+        WHERE "sampleSNo" = %s
+        AND "chipSNo"   = %s
+    """
+    twes = sqlquery(sql, [sampleid, chipid])
+    twes['originalQualityControl'] = twes['QC_pass'].apply(lambda x: "PASS" if x is True else "FAIL")
+         
     # Quality info section
     ## section 1: QC summary
-    niptQC1 = T03all[['sampleSNo','chipSNo','originalQualityControl','mean_target_coverage','10x']]
-    niptQC1 = {k: v[0] for k, v in niptQC1.to_dict(orient='list').items()}
-    allpass = T03all['QC_pass'].values[0]
+    wesQC1 = twes[["sex" ,'mean_target_coverage','10x','originalQualityControl']]
+    wesQC1 = {k: v[0] for k, v in wesQC1.to_dict(orient='list').items()}
+    wesQC1 = safe_json_value(wesQC1)
 
-    ## section2: QC detail (lack of FCPercent)
-    niptQC2 = T03all.drop(['sampleSNo','chipSNo'],axis=1)
-    niptQC2 = {k: v[0] for k, v in niptQC2.to_dict(orient='list').items()}
+    ## section2: QC detail
+    wesQC2 = twes[['input_reads',"aligned_reads" ,'aligned','uniformity_of_coverage','enrichment','padded_enrichment']]
+    wesQC2 = {k: v[0] for k, v in wesQC2.to_dict(orient='list').items()}
+    wesQC2 = safe_json_value(wesQC2)
 
     # Analysis info section
-    ## section 1: ID
-    niptR1 = T03all[['sampleSNo','chipSNo','status','qualified']]
-    niptR1 = {k: v[0] for k, v in niptR1.to_dict(orient='list').items()}
-
-    ## section 2: result
-    niptR2 = T03all[['sampleSNo','chipSNo','pregnantName','analysisProcess',"redrawBlood", "originalQualityControl"]]
-    niptR2 = {k: v[0] for k, v in niptR2.to_dict(orient='list').items()}
+    ## section 1: SNV reuslts
+    sample_id = f"{sampleid}_{chipid}"
+    sql = """
+        SELECT *
+        FROM snv_annotation
+        WHERE sample_id = %s
+            AND report = TRUE
+     """
+    report_snv = sqlquery(sql, [sample_id]) 
+    # print(report_snv.columns)
     
-    ## section 3: T13, T18, T21 更新為all chr table (same as CNV info section-niptR3)
+    report_snv['hgvsp']=report_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
+    report_snv['variant_detail']=report_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
+    report_snv['genotype'] = report_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+    snv_report = report_snv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
+    snv_report = snv_report.to_dict(orient="records")
 
-    ## section 4: result (according to testItem...)
-    ## Check item
-    testItem = T03all['testItem'].values[0]
-    testDetail = T03all['testDetail'].values[0]
+    ## section 2: CNV reuslts
+    sql = """
+        SELECT *
+        FROM cnv_annotation
+        WHERE sample_id = %s
+            AND report = TRUE
+            AND gene IN (SELECT gene FROM inheritance)
+     """
+    report_cnv = sqlquery(sql, [sample_id])
+    report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
+    report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+    cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
+    cnv_report = cnv_report.to_dict(orient="records")
 
-    if testItem == 'NIPTPLUS' and testDetail == "FFAK":
-        s44sql = f"""
-        SELECT 
-            "NIPTTestResults", 
-            "CNVin38" as "CNVTestResults_in",
-            "CNVout38" as "CNVTestResults_out",
-            "microdeletion_all",
-            CASE 
-                WHEN (
-                    ("T13_18_21" IS NOT NULL AND "T13_18_21" != 'nan') OR
-                    ("SCA" IS NOT NULL AND "SCA" != 'nan') OR
-                    ("microdeletion" IS NOT NULL AND "microdeletion" != 'nan') OR
-                    ("RAAin38" IS NOT NULL AND "RAAin38" != 'nan') OR
-                    ("RAAout38" IS NOT NULL AND "RAAout38" != 'nan')
-                ) THEN 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '高風險'
-                        ELSE '高風險, ' || REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-                ELSE 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '無異常'
-                        ELSE REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-            END AS "NIPTReminderInformation"
-        FROM "niptcoreanalysis"
-        WHERE "sampleSNo" = '{sampleid}'
-        AND "chipSNo" = '{chipid}';
-        """
-    elif testItem == 'NIPTPLUS' and testDetail == "FFAW":
-        s44sql = f"""
-        SELECT 
-            "NIPTTestResults", 
-            "CNVin38" as "CNVTestResults_in",
-            "CNVout38" as "CNVTestResults_out",
-            "microdeletion_all", 
-            CASE 
-                WHEN (
-                ("T13_18_21" IS NOT NULL AND "T13_18_21"!= 'nan') 
-                OR ("SCA" IS NOT NULL AND "SCA"!= 'nan') 
-                OR ("microdeletion" IS NOT NULL AND "microdeletion"!= 'nan') 
-                OR ("RAAin38" IS NOT NULL AND "RAAin38"!= 'nan') 
-                OR ("RAAout38" IS NOT NULL AND "RAAout38"!= 'nan') 
-                OR ("CNVin38" IS NOT NULL AND "CNVin38"!= 'nan') 
-                OR ("CNVout38" IS NOT NULL AND "CNVout38"!= 'nan')
-                ) THEN 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '高風險'
-                        ELSE '高風險, ' || REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-                ELSE 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '無異常'
-                        ELSE REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-            END AS "NIPTReminderInformation"
-        FROM "niptcoreanalysis"
-        WHERE "sampleSNo" = '{sampleid}'
-        AND "chipSNo" = '{chipid}';
-        """
-    else:
-        s44sql = f"""
-        SELECT 
-            "NIPTTestResults",
-            "CNVin38" as "CNVTestResults_in",
-            "CNVout38" as "CNVTestResults_out",
-            "microdeletion_all", 
-            CASE 
-                WHEN (
-                ("T13_18_21" IS NOT NULL AND "T13_18_21"!= 'nan') 
-                OR ("SCA" IS NOT NULL AND "SCA"!= 'nan') 
-                OR ("RAAin38" IS NOT NULL AND "RAAin38"!= 'nan') 
-                OR ("RAAout38" IS NOT NULL AND "RAAout38"!= 'nan') 
-                ) THEN 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '高風險'
-                        ELSE '高風險, ' || REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-                ELSE 
-                    CASE 
-                        WHEN qualified = 'Yes' THEN '無異常'
-                        ELSE REGEXP_REPLACE(qualified, '^No\\((.*)\\)$', '\\1') || ' fail'
-                    END
-            END AS "NIPTReminderInformation"
-        FROM "niptcoreanalysis"
-        WHERE "sampleSNo" = '{sampleid}'
-        AND "chipSNo" = '{chipid}';
-        """
+    # small variant section
+    ## section 1: reported variants
 
-    niptR4 = sqlquery(s44sql)
-    niptR4 = niptR4.replace('nan', '-').replace('', '-')
-    niptR4 = niptR4.replace('-', '低風險')
-    niptR4 = {k: v[0] for k, v in niptR4.to_dict(orient='list').items()}
+    report_snv['location']=report_snv.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
+    report_variants_table = report_snv[['chrom','location','gene','transcript','variant_detail','total_reads','genotype']]
+    report_variants_table = report_variants_table.to_dict(orient="records")
 
-    ## section 5: reference
-    niptR5 = T03all[['RawReads','Total_rds','UniMap_rds','Unimap_gc','Duprate',"UniqPercent", "ff"]]
-    niptR5 = {k: v[0] for k, v in niptR5.to_dict(orient='list').items()}
+    ## section 2: other variants within gene panel
+    sql='''
+        SELECT *
+        FROM snv_annotation
+        WHERE sample_id = %s
+            AND report = FALSE
+            AND gene in (select gene from inheritance)
+        '''
+    other_snv = sqlquery(sql, [sample_id])
+    other_snv['location'] = other_snv.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
+    other_snv['hgvsp'] = other_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
+    other_snv['variant_detail'] = other_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
+    other_snv['genotype'] = other_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+    other_variants_table = other_snv[['chrom','location','gene','transcript','variant_detail','total_reads','genotype']]
+    other_variants_table = other_variants_table.to_dict(orient="records")
 
-    # CNV info section
-    ## Check CNV
-    csql = f"""select * from "chip_info" where "chipSNo" = '{chipid}'"""
-    chipdf = sqlquery(csql)
-    analysisfolder= chipdf['analysisfolder'].iloc[0]
 
-    sample_data = T03all
-    result_path1 = os.path.join(settings.BASE_DIR, "nipt/static/tmp/analysis",analysisfolder,"result",sampleid,sampleid+".plots")
-    result_path2 = os.path.join("static/tmp/analysis",analysisfolder,"result",sampleid,sampleid+".plots")
-    chromosome_dict = {}
-    niptR3 ={}
-    #all Chr 
-    microdeletion_list = sample_data['microdeletion_all'].apply(lambda x: x.split('\n')).tolist()
-    for chr_label in list(range(1, 23)) + ['X', 'Y']:
-        zscore = '-' if pd.isna(sample_data[f'{chr_label}_zscore'].values[0]) else round(float(sample_data[f'{chr_label}_zscore'].values[0]), 2)
-        ratio = '-' if pd.isna(sample_data[f'{chr_label}_ratio'].values[0]) else round(float(sample_data[f'{chr_label}_ratio'].values[0])*100, 5)
-        cnvplot = os.path.join(result_path1, f"chr{chr_label}.png")
-        microdeletion_match = []
-        for microdeletion in microdeletion_list:
-            for entry in microdeletion:
-                if f'loss({chr_label}:' in entry or f'gain({chr_label}:' in entry:
-                    microdeletion_match.append(entry)
-        if len(microdeletion_match) == 0:
-            microdeletion_match.append('-')
-        if os.path.exists(cnvplot):
-            cnvplot=os.path.join(result_path2, f"chr{chr_label}.png")
-            chromosome_dict[f'chr{chr_label}'] = {
-                'zscore': zscore,
-                'ratio': ratio,
-                'CNVDownload': cnvplot,
-                'microdeletion_all': '\n'.join(microdeletion_match)
+    # copy number variant section
+    ## section1: reported cnv
+    report_cnv['location']=report_cnv.apply(lambda x: f"{x['chrom']}:{str(x['start_pos'])}:{x['end_pos']}:{x['cn_type']}",axis=1)
+    report_cnv_table = report_cnv[['location','gene','transcript','variant_detail','quality','genotype']]
+    report_cnv_table = {k: v for k, v in report_cnv_table.to_dict(orient='list').items()}
+    report_cnv_table = safe_json_value(report_cnv_table)
+
+    ## section2: other cnv
+    sql='''
+        SELECT *
+        FROM cnv_annotation
+        WHERE sample_id = %s
+            AND report = FALSE
+            AND gene in (select gene from inheritance)
+        '''
+    other_cnv = sqlquery(sql, [sample_id])
+    other_cnv['location']=other_cnv.apply(lambda x: f"{x['chrom']}:{str(x['start_pos'])}:{x['end_pos']}:{x['cn_type']}",axis=1)
+    other_cnv['variant_detail']=other_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
+    other_cnv_table = other_cnv[['location','gene','transcript','variant_detail','quality','genotype']]
+    other_cnv_table = {k: v for k, v in other_cnv_table.to_dict(orient='list').items()}
+    other_cnv_table = safe_json_value(other_cnv_table)
+
+
+    final = {"quality_info":{"section1":wesQC1, "section2":wesQC2},
+            "analysis_info":{"section1":snv_report, "section2":cnv_report},
+            "snv_info":{"section1":report_variants_table,"section2":other_variants_table}
             }
-        niptR3[f'chr{chr_label}'] = {
-            'zscore': zscore,
-            'ratio': ratio
-        }
-
-    s7sql = f"""select * from cnvdata where "sampleSNo" = '{sampleid}' AND "chipSNo" = '{chipid}'"""
-    cnvdata = sqlquery(s7sql)
-    if cnvdata.shape[0] == 0:
-        status = '-'
-    else:
-        status = ','.join(cnvdata['result'])
-
-    zip_file = os.path.join(settings.BASE_DIR, "nipt/static/tmp/analysis",analysisfolder,"result",sampleid,sampleid+"_cnv.zip")
-    zip_directory(result_path1, zip_file)
-    zip_path=os.path.join("static/tmp/analysis",analysisfolder,"result",sampleid, f"{sampleid}_cnv.zip")
-
-    niptR6 = {"sampleSNo":sampleid, "chipSNo":sample_data['chipSNo'].values[0],'qualified': allpass, "CNVTestResults":status, "CNVDownload":zip_path}
-    final = {"sample_info":{"section1":niptSample1, "section2": niptSample2}, 
-             "quality_info":{"section1":niptQC1, "section2":niptQC2}, 
-             "analysis_info":{"section1":niptR1, "section2":niptR2, "section3":niptR3, "section4":niptR4, "section5":niptR5}, 
-             "cnv_info":{"section1":niptR6,"section2":chromosome_dict}}        
-'''
-    return JsonResponse({"Code":200, "Msg":"test"})
+    #final = {"quality_info":{"section1":wesQC1, "section2":wesQC2},
+    #         "analysis_info":{"section1":snv_report, "section2":cnv_report},
+    #         "snv_info":{"section1":report_variants_table,"section2":other_variants_table},
+    #         "cnv_info":{"section1":report_cnv_table,"section2":other_cnv_table}
+    #} 
+    print(final)
+    return JsonResponse({"Code":200, "Msg": final})
 
 ## Management Section
 ### API-C01
@@ -903,7 +997,7 @@ def chipsearch(request):
         findstarttime = request.POST['findstarttime']
         findendtime = request.POST['findendtime']
         findstatus = request.POST['findstatus']
-
+        print("test")
         if userid is None:
             return JsonResponse({"Code":500, "Msg":"Error found on server"})
 
@@ -950,25 +1044,31 @@ def chip_add(request):
         return JsonResponse({"Code": 500, "Msg": f"已有相同晶片 {chipid} 於資料庫內"})
     sequencingDate, samplelist, samplesize = get_sequencing_info(chipid)
 
+    vid = get_latest_vid()
+    if vid is None:
+        return JsonResponse({"Code": 500, "Msg": "wesversion vid not get"})
+
     try:
         # 沒有 sample 資料
         if not samplelist or samplesize == 0:
             sqlexe(
                 """
-                INSERT INTO chip_info ("chipSNo","sequencingDate","sampleSize","status")
-                VALUES (%s,%s,%s,%s)
+                INSERT INTO chip_info ("chipSNo","sequencingDate","sampleSize","status","vid")
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT ("chipSNo") DO NOTHING
                 """,
-                [chipid, sequencingDate, samplesize, "晶片已創建"]
+                [chipid, sequencingDate, samplesize, "晶片已創建", vid]
             )
             return JsonResponse({"Code": 200,"Msg": f"晶片 {chipid} 已建立，但沒有找到 sequencing 資料"})
 
         # 有 sample 資料
         sqlexe(
             """
-            INSERT INTO chip_info ("chipSNo","sequencingDate","sampleSize","status","copycomplete")
-            VALUES (%s,%s,%s,%s,%s)
+            INSERT INTO chip_info ("chipSNo","sequencingDate","sampleSize","status","copycomplete","vid")
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT ("chipSNo") DO NOTHING
             """,
-            [chipid, sequencingDate, samplesize, "準備分析", True]
+            [chipid, sequencingDate, samplesize, "準備分析", True, vid]
         )
 
         for sample in samplelist:
@@ -977,6 +1077,7 @@ def chip_add(request):
                 """
                 INSERT INTO sample_info ("UniID","sampleSNo","chipSNo","status")
                 VALUES (%s,%s,%s,%s)
+                ON CONFLICT ("UniID") DO NOTHING
                 """,
                 [UniID, sample, chipid, "待分析"]
             )
@@ -1003,11 +1104,8 @@ def chip_delete(request):
     try:
         sqlexe(f"""DELETE FROM chip_info WHERE "chipSNo" IN %s""", [tuple(chip_list)])
         sqlexe(f"""DELETE FROM sample_info WHERE "chipSNo" IN %s""", [tuple(chip_list)])
-        sqlexe(f"""DELETE FROM "Mapping" where "chipSNo"= %s""", [tuple(chip_list)])
+        sqlexe(f"""DELETE FROM "run_qc" where "chipSNo"= %s""", [tuple(chip_list)])
         sqlexe(f"""DELETE FROM "QCanalysis" where "chipSNo"= %s""", [tuple(chip_list)])
-        sqlexe(f"""DELETE FROM "niptdata" where "chipSNo"= %s""", [tuple(chip_list)])
-        sqlexe(f"""DELETE FROM "cnvdata" where "chipSNo"= %s""", [tuple(chip_list)])
-        sqlexe(f"""DELETE FROM "microdeletion" where "chipSNo"= %s""", [tuple(chip_list)])
         chip_str = ", ".join(chip_list)
         return JsonResponse({"Code":200, "Msg":f"""{chip_str}晶片與相關樣本紀錄皆從資歷料庫已刪除，頁面請重新整理！"""})
     except:
@@ -1018,21 +1116,7 @@ def chip_renew(request):
     chipid = request.POST['chipSNo']
     try:
         sqlexe(f"""UPDATE chip_info SET "status" = '晶片已創建' where "chipSNo"= %s""", [chipid])
-        #刪除所有結果
-        sqlexe(f"""DELETE FROM sample_info where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "Mapping" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "QCanalysis" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "niptdata" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "cnvdata" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "microdeletion" where "chipSNo"= %s""", [chipid])
-        # 確認晶片的樣本數量
-        csql = f"""select * from "sample_info" where "chipSNo" = '{chipid}'"""
-        chipdf = sqlquery(csql)
-        sample_N = len(chipdf)
-        # Update chipid status
-        chipsql = f"""UPDATE "chip_info" SET "sampleSize" = %s WHERE "chipSNo" = %s"""
-        sqlexe(chipsql, [sample_N, chipid])
-
+        # check_chip_status()
         return JsonResponse({"Code":200, "Msg":{"status":"晶片已創建", "msg":f"""{chipid}晶片編號已回歸至創建狀態"""}})
     except:
         return JsonResponse({"Code":500, "Msg":"不明原因出錯，請洽管理人員!"})
@@ -1042,21 +1126,9 @@ def chip_cancel(request):
     chipid = request.POST['chipSNo']
     try:
         sqlexe(f"""UPDATE chip_info SET "status" = '晶片已作廢' where "chipSNo"= %s""", [chipid])
-        # #更新sample_metadata supplement狀態-->樣品錄入
-        # update_sample_metadata(chipid, '樣本錄入')
         sqlexe(f"""DELETE FROM sample_info where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "Mapping" where "chipSNo"= %s""", [chipid])
         sqlexe(f"""DELETE FROM "QCanalysis" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "niptdata" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "cnvdata" where "chipSNo"= %s""", [chipid])
-        sqlexe(f"""DELETE FROM "microdeletion" where "chipSNo"= %s""", [chipid])
-        # 確認晶片的樣本數量
-        csql = f"""select * from "sample_info" where "chipSNo" = '{chipid}'"""
-        chipdf = sqlquery(csql)
-        sample_N = len(chipdf)
-        # Update chipid status
-        chipsql = f"""UPDATE "chip_info" SET "sampleSize" = %s WHERE "chipSNo" = %s"""
-        sqlexe(chipsql, [sample_N, chipid])
+        sqlexe(f"""DELETE FROM "run_qc" where "chipSNo"= %s""", [chipid])
         return JsonResponse({"Code":200, "Msg":{"status":"晶片已作廢","msg":f"""{chipid}晶片編號已作廢"""}})
     except:
         return JsonResponse({"Code":500, "Msg":"不明原因發生，請洽管理人員!"})
@@ -1136,10 +1208,10 @@ def chip_sampleDetail(request):
             q."10x",
             q."mean_target_coverage",
             q."uniformity_of_coverage",
-            q."aligned_reads" as "aligned reads",
+            q."aligned_reads",
             q."aligned",
             q."enrichment",
-            q."padded_enrichment" as "meanpadded_enrichment"
+            q."padded_enrichment"
         FROM "sample_info" AS s
         JOIN "QCanalysis" AS q
         ON q."UniID" = s."UniID"   -- 以 UniID 對齊，最安全不會錯位
@@ -1159,7 +1231,7 @@ def chip_sampleDetail(request):
         """
     
     dfs = sqlquery(sql, [chipid])
-    dfs = dfs.fillna("")
+    dfs = dfs.replace('nan', '-').replace('', '-')
     dftmp = dfs.to_json(orient='records')
     dfout = json.loads(dftmp)
 
@@ -1270,11 +1342,18 @@ def analysis_submit(request):
     # Check chipid exist in database:
     csql = f"""select * from "chip_info" where "chipSNo" = '{chipid}'"""
     chipdf = sqlquery(csql)
+    vsql = """SELECT vid FROM wesversion ORDER BY "updateTime" DESC LIMIT 1"""
+    versiondf = sqlquery(vsql)
+    latest_vid = versiondf.iloc[0]["vid"]
     if chipdf.shape[0] != 1:
         return JsonResponse({"Code":500, "Msg":"並已無此晶片紀錄，請重新整理頁面或者通知管理人員!"})
     todate = datetime.now().strftime("%Y%m%d_%H%M%S")
+    status = chipdf['status'].iloc[0]
+    vid = chipdf['vid'].iloc[0]
+    aid = f"{chipid}-{vid}"
+    chipanalysisfolder = chipdf['analysisfolder'].iloc[0]
     # Check sample data is uploaded to the database
-    if chipdf['status'].iloc[0] == "準備分析":
+    if status == "準備分析":
         # Check NS2000_path chipid位置: 
         directories = sorted([d for d in os.listdir(NS2000_path) if os.path.isdir(os.path.join(NS2000_path, d))], reverse=True)
         folders = [directory for directory in directories if chipid in directory]
@@ -1282,35 +1361,99 @@ def analysis_submit(request):
             folder=folders[0]
             batch_path = os.path.join(NS2000_path, folder)  
 
-            #創建資料夾
-            analysisfolder = f"{chipid}_{todate}"
-            tmp_analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "tmp", "analysis")
-            job_path = os.path.join(tmp_analysis_path, analysisfolder)
-            os.makedirs(job_path)
+            if pd.isna(chipanalysisfolder):
+                #創建資料夾
+                analysisfolder = f"{chipid}_{todate}"
+                tmp_analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "tmp", "analysis")
+                job_path = os.path.join(tmp_analysis_path, analysisfolder)
+                os.makedirs(job_path)
 
-            #從資料庫中抓取資料做sample_list.csv
-            sql = f"""SELECT "sampleSNo" FROM "sample_info" WHERE "chipSNo" = '{chipid}' AND "status" = '待分析'"""
-            dfs = sqlquery(sql)
-            dfs.to_csv(os.path.join(job_path, "sample_list.csv"), index=False)
+                #從資料庫中抓取資料做sample_list.csv
+                sql = f"""SELECT "sampleSNo" FROM "sample_info" WHERE "chipSNo" = '{chipid}' AND "status" = '待分析'"""
+                dfs = sqlquery(sql)
+                dfs.to_csv(os.path.join(job_path, "sample_list.csv"), index=False)
 
-            #執行nextflow程式碼
-            try:
-                os.chdir(tmp_analysis_path)
-                configfile = os.path.join(settings.BASE_DIR,"bin/nextflow.config")
-                date = datetime.now().strftime("%Y/%m/%d")
-                nf = os.path.join(settings.BASE_DIR, "bin/wes_pipeline.nf")
-                command = f"{nextflow} run -ansi-log false {nf} --input {batch_path} --output {job_path} -c {configfile} > {job_path}/std.out 2> {job_path}/std.err -bg -with-trace {job_path}/trace.txt"
-                run_nextflow = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                time.sleep(10)
-                
-                # #chip_info 更新
-                status="檢測分析進行中"
-                sqlexe(f"""UPDATE chip_info SET "status" = %s, "analysisTime" = %s, "analysisfolder" = %s where "chipSNo"= %s""", [status, date, analysisfolder, chipid])
+                #執行nextflow程式碼
+                try:
+                    os.chdir(tmp_analysis_path)
+                    configfile = os.path.join(settings.BASE_DIR,"bin/nextflow.config")
+                    date = datetime.now().strftime("%Y/%m/%d")
+                    nf = os.path.join(settings.BASE_DIR, "bin/wes_pipeline.nf")
+                    command = f"{nextflow} run -ansi-log false {nf} --input {batch_path} --output {job_path} -c {configfile} > {job_path}/std.out 2> {job_path}/std.err -bg -with-trace {job_path}/trace.txt"
+                    run_nextflow = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    time.sleep(10)
+                    
+                    # #chip_info 更新
+                    status="檢測分析進行中"
+                    sqlexe('UPDATE chip_info SET "status"=%s,"analysisTime"=%s,"analysisfolder"=%s WHERE "chipSNo"=%s',
+                        [status, date, analysisfolder, chipid])
+                    sqlexe('INSERT INTO chip_analysis ("aid","chipSNo","analysisTime","analysisfolder","vid") VALUES (%s,%s,%s,%s,%s)',
+                        [aid, chipid, date, analysisfolder, vid])
+                    return JsonResponse({"Code":200, "Msg": {"msg": f"{chipid}晶片已開始分析!!!!"}})
+                except:
+                    return JsonResponse({"Code":500, "Msg":"分析執行有誤，請確認"})
+            else:
+                if latest_vid != vid:
+                    #創建資料夾
+                    analysisfolder = f"{chipid}_{todate}"
+                    tmp_analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "tmp", "analysis")
+                    job_path = os.path.join(tmp_analysis_path, analysisfolder)
+                    os.makedirs(job_path)
 
-                return JsonResponse({"Code":200, "Msg": {"msg": f"{chipid}晶片已開始分析!!!!"}})
-            except:
-                return JsonResponse({"Code":500, "Msg":"分析執行有誤，請確認"})
+                    #從資料庫中抓取資料做sample_list.csv
+                    sql = f"""SELECT "sampleSNo" FROM "sample_info" WHERE "chipSNo" = '{chipid}' AND "status" = '待分析'"""
+                    dfs = sqlquery(sql)
+                    dfs.to_csv(os.path.join(job_path, "sample_list.csv"), index=False)
 
+                    #執行nextflow程式碼
+                    try:
+                        os.chdir(tmp_analysis_path)
+                        configfile = os.path.join(settings.BASE_DIR,"bin/nextflow.config")
+                        date = datetime.now().strftime("%Y/%m/%d")
+                        nf = os.path.join(settings.BASE_DIR, "bin/wes_pipeline.nf")
+                        command = f"{nextflow} run -ansi-log false {nf} --input {batch_path} --output {job_path} -c {configfile} > {job_path}/std.out 2> {job_path}/std.err -bg -with-trace {job_path}/trace.txt"
+                        run_nextflow = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        time.sleep(10)
+                        
+                        # #chip_info 更新
+                        status="檢測分析進行中"
+                        sqlexe('UPDATE chip_info SET "status"=%s,"analysisTime"=%s,"analysisfolder"=%s WHERE "chipSNo"=%s',
+                            [status, date, analysisfolder, chipid])
+                        sqlexe('INSERT INTO chip_analysis ("aid","chipSNo","analysisTime","analysisfolder","vid") VALUES (%s,%s,%s,%s,%s)',
+                            [aid, chipid, date, analysisfolder, vid])
+                        return JsonResponse({"Code":200, "Msg": {"msg": f"{chipid}晶片已開始分析新版本!!!!"}})
+                    except:
+                        return JsonResponse({"Code":500, "Msg":"新版本分析執行有誤，請確認"})
+                else:
+                    tmp_analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "tmp", "analysis")
+                    analysis_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis")
+                    job_path = os.path.join(analysis_path, chipanalysisfolder)
+
+                    #從資料庫中抓取資料做sample_list.csv
+                    sql = f"""SELECT "sampleSNo" FROM "sample_info" WHERE "chipSNo" = '{chipid}' AND "status" = '待分析'"""
+                    dfs = sqlquery(sql)
+                    dfs.to_csv(os.path.join(job_path, "sample_list.csv"), index=False)
+
+                    #執行nextflow程式碼
+                    try:
+                        os.chdir(tmp_analysis_path)
+                        configfile = os.path.join(settings.BASE_DIR,"bin/nextflow.config")
+                        date = datetime.now().strftime("%Y/%m/%d")
+                        nf = os.path.join(settings.BASE_DIR, "bin/wes_pipeline.nf")
+                        command = f"{nextflow} run -ansi-log false {nf} --input {batch_path} --output {job_path} --only_filter -c {configfile} > {job_path}/std2.out 2> {job_path}/std2.err -bg -with-trace {job_path}/trace2.txt"
+                        run_nextflow = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        time.sleep(10)
+                        
+                        # #chip_info 更新
+                        status="重跑分析進行中"
+                        sqlexe('UPDATE chip_info SET "status"=%s,"analysisTime"=%s WHERE "chipSNo"=%s',
+                            [status, date, chipid])
+                        sqlexe('UPDATE chip_analysis SET "analysisTime"=%s WHERE "aid"=%s',
+                            [date, aid])
+
+                        return JsonResponse({"Code":200, "Msg": {"msg": f"{chipid}晶片已開始重跑分析!!!!"}})
+                    except:
+                        return JsonResponse({"Code":500, "Msg":"重跑分析執行有誤，請確認"})
         elif len(folders)==0:
             return JsonResponse({"Code":500, "Msg":f"NS2000 path 未有{chipid}的下機資料"})
     else:
