@@ -458,7 +458,7 @@ def variant_to_database(result_path,chipID):
                             RETURNING variant_id;
                             """, 
                             [chrom, pos, ref_base, alt_base],True)
-                variant_cache[key]=variant_id
+                    variant_cache[key]=variant_id
                 variant_id=variant_cache[key]
                 
                 ## collect rows for sample_variant and consequence
@@ -596,7 +596,7 @@ def cnv_to_database(result_path,chipID):
                             RETURNING variant_id;
                             """, 
                             [chrom, start_pos, end_pos, cn_type],True)
-                variant_cache[key]=variant_id
+                    variant_cache[key]=variant_id
                 variant_id=variant_cache[key]
                 
                 ## collect rows for sample_variant and consequence
@@ -694,7 +694,7 @@ def count_exons(region, total_exons=None):
     elif right == "txend":
         if total_exons is None:
             raise ValueError("total_exons must be provided when using txEnd")
-        end_exon = total_exons
+        end_exon = int(total_exons)
     else:
         raise ValueError(f"Invalid right boundary: {right}")
 
@@ -781,6 +781,30 @@ def get_latest_vid():
         return None
     return df.iloc[0]['vid']
 
+def build_population(r):
+    """
+    輸入object array，編排 gnomad 的欄位
+    """
+    result = []
+    GNOMAD_SUBPOPS = [
+        ('African', 'afr'),
+        ('American', 'amr'),
+        ('East Asian', 'eas'),
+        ('European Finnish', 'fin'),
+        ('European Non Finnish', 'nfe'),
+        ('South Asian', 'sas'),
+        ('Total', ''),
+    ]
+    for name, suffix in GNOMAD_SUBPOPS:
+        s = f"_{suffix}" if suffix else ""
+        result.append({
+            'subpopulation': name,
+            'allele_frequency': r[f'gnomad4__af{s}'] if pd.notna(r[f'gnomad4__af{s}']) else '-',
+            'allele_count': int(r[f'gnomad4__ac{s}']) if pd.notna(r[f'gnomad4__ac{s}']) else '-',
+            'allele_number': int(r[f'gnomad4__an{s}']) if pd.notna(r[f'gnomad4__an{s}']) else '-',
+            'allele_homo_alt': int(r[f'gnomad4__nhomalt{s}']) if pd.notna(r[f'gnomad4__nhomalt{s}']) else '-',
+        })
+    return result
 
 #########################################API####################################################
 ## WESCoreAnalysis Section
@@ -842,15 +866,15 @@ def coreanalysis_download(request):
     sql = """SELECT * FROM wescoreanalysis"""
     coredf = sqlquery(sql)
     coredf = coredf.loc[:, ~coredf.columns.duplicated()]
-    coredf = coredf.drop(columns=["UniID"])
-    tnipt = coredf[coredf["testidx"].isin(corelist)]
+    # coredf = coredf.drop(columns=["UniID"])
+    twes = coredf[coredf["testidx"].isin(corelist)]
 
     ## Make file
     now = datetime.now()
     output_name = f"wesINFO_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
     outpath = os.path.join(settings.BASE_DIR, 'wes/static/tmp/wesdata', output_name)
     filepath = os.path.join('/static/tmp/wesdata', output_name)
-    tnipt.to_excel(outpath, index=False)
+    twes.to_excel(outpath, index=False)
 
     return JsonResponse({"Code":200, "Msg":{"core_durl":filepath}})
 
@@ -929,26 +953,114 @@ def coreanalysis_detail(request):
     cnv_report = cnv_report.to_dict(orient="records")
 
     # small variant section
-    ## section 1: reported variants
-
-    report_snv['location']=report_snv.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
-    report_variants_table = report_snv[['chrom','location','gene','transcript','variant_detail','total_reads','genotype']]
-    report_variants_table = report_variants_table.to_dict(orient="records")
-
-    ## section 2: other variants within gene panel
+    ## query variants inside gene panel
     sql='''
         SELECT *
         FROM snv_annotation
         WHERE sample_id = %s
-            AND report = FALSE
             AND gene in (select gene from inheritance)
         '''
-    other_snv = sqlquery(sql, [sample_id])
-    other_snv['location'] = other_snv.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
-    other_snv['hgvsp'] = other_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
-    other_snv['variant_detail'] = other_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
-    other_snv['genotype'] = other_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    other_variants_table = other_snv[['chrom','location','gene','transcript','variant_detail','total_reads','genotype']]
+    snv_in_panel = sqlquery(sql, [sample_id])
+    snv_in_panel['location'] = snv_in_panel.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
+    snv_in_panel['hgvsp'] = snv_in_panel['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
+    snv_in_panel['variant_detail'] = snv_in_panel.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
+    snv_in_panel['genotype'] = snv_in_panel['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+
+    ## load opencravat annotation table
+    analysisfolder=sqlquery(
+        '''
+        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s 
+        ''',
+        [chipid])['analysisfolder'].loc[0]
+    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
+    db_path = f"{file_path}/{sampleid}/opencravat/{sampleid}.hard-filtered.sqlite"
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            snv_ann_table = pd.read_sql_query(
+                "SELECT * FROM variant;",
+                conn
+            )
+    except sqlite3.OperationalError as e:
+        snv_ann_table = None
+        print(f"[{sampleid}] SQLite error: {e}")
+    except Exception as e:
+        snv_ann_table = None
+        print(f"[{sampleid}] Unexpected error: {e}")
+
+    ## merge two tables
+    snv_in_panel = snv_in_panel.merge(snv_ann_table,
+                       left_on=['chrom','pos','ref_base','alt_base'],
+                       right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
+                       how='left')
+    
+    snv_in_panel['allele_balance'] = snv_in_panel['vcfinfo__af'].round(3)
+    
+    ## assign info dict
+    records = snv_in_panel.to_dict(orient='records')
+    snv_in_panel['info'] = [
+        {
+            'coding_detail': {
+                'total_reads': r['total_reads'],
+                'allele_reads': r['alt_reads'],
+                'allele_balance': r['allele_balance'],
+                'genotype': r['genotype'],
+                'filter': r['filter'],
+                'quality': r['quality'],
+                'fs': r['extra_vcf_info__FS'],
+                'qd': r['extra_vcf_info__QD'],
+                'sor': r['extra_vcf_info__SOR'],
+                'mq': r['extra_vcf_info__MQ'],
+                'mqranksum': r['extra_vcf_info__MQRankSum'],
+                'readposranksum': r['extra_vcf_info__ReadPosRankSum'],
+            },
+            'consequence': {
+                'gene': r['gene'],
+                'transcript': r['transcript'],
+                'exon': r['exon'],
+                'hgvsc': r['hgvsc'],
+                'hgvsp': r['hgvsp'],
+                'impact': r['impact'],
+            },
+            'clinvar': {
+                'clinical_significance': r['clinvar__sig'],
+                'review_status': r['clinvar__rev_stat'],
+                'clinvar_id': r['clinvar__id'],
+            },
+            'population': build_population(r),
+            'prediction':[
+                {
+                    'tool':'REVEL',
+                    'score':r['revel__rankscore'] if pd.notna(r['revel__rankscore']) else '-',
+                    'class':f"Pathogenic_{r['revel__pp3_pathogenic']}" if pd.notna(r['revel__pp3_pathogenic']) else '-'},
+                {
+                    'tool':'VEST4',
+                    'score':r['vest__score'] if pd.notna(r['vest__score']) else '-',
+                    'class':f"Pathogenic_{r['vest__pp3_pathogenic']}" if pd.notna(r['vest__pp3_pathogenic']) else '-'},
+                {
+                    'tool':'dbscsnv_ada',
+                    'score':r['dbscsnv__ada_score'] if pd.notna(r['dbscsnv__ada_score']) else '-',
+                    'class':"Pathogenic" if r['dbscsnv__ada_score']>0.7 else '-'},
+                {
+                    'tool':'spliceai',
+                    'score':max(r['spliceai__ds_ag'],r['spliceai__ds_al'],r['spliceai__ds_dg'],r['spliceai__ds_dl']) if pd.notna(r['spliceai__ds_ag']) else '-',
+                    'class':"Pathogenic" if max(r['spliceai__ds_ag'],r['spliceai__ds_al'],r['spliceai__ds_dg'],r['spliceai__ds_dl'])>0.5 else '-'
+                },
+            ]
+        }
+        for r in records
+    ]
+
+    snv_in_panel['chr']=snv_in_panel['chrom']
+
+    ## section 1: reported variants
+    report_variants_table = snv_in_panel[snv_in_panel['report']]
+    report_variants_table = report_variants_table[['chr','location','gene','transcript','variant_detail','total_reads','genotype','info']]
+    report_variants_table = report_variants_table.to_dict(orient="records")
+
+    ## section 2: other variants within gene panel
+    other_variants_table = snv_in_panel[~snv_in_panel['report']]
+    other_variants_table = other_variants_table[['chr','location','gene','transcript','variant_detail','total_reads','genotype','info']]
     other_variants_table = other_variants_table.to_dict(orient="records")
 
 
@@ -974,16 +1086,20 @@ def coreanalysis_detail(request):
     other_cnv_table = {k: v for k, v in other_cnv_table.to_dict(orient='list').items()}
     other_cnv_table = safe_json_value(other_cnv_table)
 
-
-    final = {"quality_info":{"section1":wesQC1, "section2":wesQC2},
-            "analysis_info":{"section1":snv_report, "section2":cnv_report},
-            "snv_info":{"section1":report_variants_table,"section2":other_variants_table}
-            }
-    #final = {"quality_info":{"section1":wesQC1, "section2":wesQC2},
-    #         "analysis_info":{"section1":snv_report, "section2":cnv_report},
-    #         "snv_info":{"section1":report_variants_table,"section2":other_variants_table},
-    #         "cnv_info":{"section1":report_cnv_table,"section2":other_cnv_table}
-    #} 
+    #final = {
+    #    "quality_info":{"section1":wesQC1, "section2":wesQC2},
+    #    "analysis_info":{"section1":snv_report, "section2":cnv_report},
+    #    "snv_info":{"section1":report_variants_table,"section2":other_variants_table},
+    #    "cnv_info":{"section1":[],"section2":[]}
+    #}
+    final = {
+        "quality_info":{"section1":wesQC1, "section2":wesQC2},
+        "analysis_info":{"section1":snv_report, "section2":cnv_report},
+        #"snv_info":{"section1":report_variants_table,"section2":other_variants_table},
+        #"cnv_info":{"section1":[],"section2":[]},
+        "sample_info":{"section1":[],"section2":[]}
+    }
+     
     print(final)
     return JsonResponse({"Code":200, "Msg": final})
 
