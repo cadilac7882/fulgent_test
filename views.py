@@ -25,6 +25,7 @@ import sqlite3
 import numpy as np
 from typing import Optional, Tuple, Dict, Any, List
 import re
+from collections import defaultdict
 
 #########################################setting####################################################
 NS2000_path = '/bioinfo/NS2000/RD/' #NS2000_path chipid位置
@@ -459,7 +460,8 @@ def variant_to_database(result_path,chipID):
                             """, 
                             [chrom, pos, ref_base, alt_base],True)
                     variant_cache[key]=variant_id
-                variant_id=variant_cache[key]
+                else:
+                    variant_id=variant_cache[key]
                 
                 ## collect rows for sample_variant and consequence
                 sample_id = f"{sample}_{chipID}"
@@ -597,7 +599,8 @@ def cnv_to_database(result_path,chipID):
                             """, 
                             [chrom, start_pos, end_pos, cn_type],True)
                     variant_cache[key]=variant_id
-                variant_id=variant_cache[key]
+                else:
+                    variant_id=variant_cache[key]
                 
                 ## collect rows for sample_variant and consequence
                 sample_id = f"{sample}_{chipID}"
@@ -806,6 +809,51 @@ def build_population(r):
         })
     return result
 
+def auto_detect_panel_name(sex,sample_id):
+    '''
+    deal with sex
+    '''
+    if sex:
+        sample_sex = 'Male' if sex=='XY' else 'Female'
+    else:
+        sample_sex = 'Female'
+    '''
+    assign panel
+    '''
+    if sample_id.startswith('CSB'):
+        return(f"CSB_{sample_sex}")
+    elif sample_id.startswith('CSF'):
+        return(f"CSF_{sample_sex}")
+    else:
+        return(f"CSF_Female")
+
+def collapse_ps_events(df):
+    df = df.copy()
+    df["_ps_group"] = df["PS"].where(
+        df["PS"].notna(),
+        pd.Series(df.index, index=df.index)
+    )
+    rows = []
+    for _, g in df.groupby("_ps_group"):
+        row = {}
+        row["gene"] = g["gene"].iloc[0]
+        row["transcript"] = g["transcript"].iloc[0]
+        row["genotype"] = g["genotype"].iloc[0]
+        row["inheritance"] = g["inheritance"].iloc[0]
+        row["condition_name"] = g["condition_name"].iloc[0]
+        has_ps = g["PS"].notna().any()
+        has_mutalyzer = g["mutalyzer_output"].notna().any()
+        if has_ps and has_mutalyzer:
+            row["variant_detail"] = (
+                g["mutalyzer_output"].dropna().iloc[0]
+                + ", "
+                + g["protein_description"].dropna().iloc[0]
+            )
+        else:
+            row["variant_detail"] = g["variant_detail"].iloc[0]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
 #########################################API####################################################
 ## WESCoreAnalysis Section
 ### API-T01
@@ -862,19 +910,58 @@ def coreanalysis(request):
 def coreanalysis_download(request):
     list_testidx = request.POST['list_testidx']
     corelist = json.loads(list_testidx)
-
     sql = """SELECT * FROM wescoreanalysis"""
     coredf = sqlquery(sql)
-    coredf = coredf.loc[:, ~coredf.columns.duplicated()]
-    # coredf = coredf.drop(columns=["UniID"])
     twes = coredf[coredf["testidx"].isin(corelist)]
+
+    all_report_snv = []
+    all_report_cnv = []
+    for _, row in twes.iterrows():
+        sampleSNo = row["sampleSNo"]
+        chipSNo = row["chipSNo"]
+        sample_id = f"{sampleSNo}_{chipSNo}"
+        # ===== SNV =====
+        sql_snv = """
+            SELECT *
+            FROM snv_annotation
+            WHERE sample_id = %s
+            AND report = TRUE
+        """
+        report_snv = sqlquery(sql_snv, [sample_id])
+        if not report_snv.empty:
+            report_snv["sample_id"] = sample_id
+            all_report_snv.append(report_snv)
+        # ===== CNV =====
+        sql_cnv = """
+            SELECT *
+            FROM cnv_annotation
+            WHERE sample_id = %s
+            AND report = TRUE
+            AND gene IN (SELECT gene FROM inheritance)
+        """
+        report_cnv = sqlquery(sql_cnv, [sample_id])
+        if not report_cnv.empty:
+            report_cnv["sample_id"] = sample_id
+            all_report_cnv.append(report_cnv)
+
+    if all_report_snv:
+        report_snv_df = pd.concat(all_report_snv, ignore_index=True)
+    else:
+        report_snv_df = pd.DataFrame()
+
+    if all_report_cnv:
+        report_cnv_df = pd.concat(all_report_cnv, ignore_index=True)
+    else:
+        report_cnv_df = pd.DataFrame()
 
     ## Make file
     now = datetime.now()
     output_name = f"wesINFO_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
     outpath = os.path.join(settings.BASE_DIR, 'wes/static/tmp/wesdata', output_name)
     filepath = os.path.join('/static/tmp/wesdata', output_name)
-    twes.to_excel(outpath, index=False)
+    with pd.ExcelWriter(outpath, engine="openpyxl") as writer:
+        report_snv_df.to_excel(writer,sheet_name="small_variant",index=False)
+        report_cnv_df.to_excel(writer,sheet_name="CNV",index=False)
 
     return JsonResponse({"Code":200, "Msg":{"core_durl":filepath}})
 
@@ -921,6 +1008,28 @@ def coreanalysis_detail(request):
     wesQC2 = safe_json_value(wesQC2)
 
     # Analysis info section
+    ## load opencravat annotation table
+    analysisfolder=sqlquery(
+        '''
+        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s 
+        ''',
+        [chipid])['analysisfolder'].loc[0]
+    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
+    db_path = f"{file_path}/{sampleid}/opencravat/{sampleid}.hard-filtered.sqlite"
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            snv_ann_table = pd.read_sql_query(
+                "SELECT * FROM variant_update;",
+                conn
+            )
+    except sqlite3.OperationalError as e:
+        snv_ann_table = None
+        print(f"[{sampleid}] SQLite error: {e}")
+    except Exception as e:
+        snv_ann_table = None
+        print(f"[{sampleid}] Unexpected error: {e}")
+
     ## section 1: SNV reuslts
     sample_id = f"{sampleid}_{chipid}"
     sql = """
@@ -935,7 +1044,19 @@ def coreanalysis_detail(request):
     report_snv['hgvsp']=report_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
     report_snv['variant_detail']=report_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
     report_snv['genotype'] = report_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    snv_report = report_snv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
+    # snv_report = report_snv[["gene" ,'mane_refseq_tx','variant_detail','genotype','inheritance','condition_name']]
+    snv_report = report_snv.merge(snv_ann_table,
+                       left_on=['chrom','pos','ref_base','alt_base'],
+                       right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
+                       how='left')
+    cols_keep = [
+        "gene","mane_refseq_tx","variant_detail","genotype",
+        "inheritance","condition_name",
+        "PS","mutalyzer_output","protein_description"
+    ]
+    snv_report = snv_report.loc[:, cols_keep].copy()
+    snv_report = snv_report.rename(columns={'mane_refseq_tx':'transcript'})
+    snv_report = collapse_ps_events(snv_report) 
     snv_report = snv_report.to_dict(orient="records")
 
     ## section 2: CNV reuslts
@@ -958,9 +1079,12 @@ def coreanalysis_detail(request):
         SELECT *
         FROM snv_annotation
         WHERE sample_id = %s
-            AND gene in (select gene from inheritance)
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name = %s) 
         '''
-    snv_in_panel = sqlquery(sql, [sample_id])
+    
+    select_panel=auto_detect_panel_name(wesQC1['sex'],sample_id)
+    
+    snv_in_panel = sqlquery(sql, [sample_id,select_panel])
     snv_in_panel['location'] = snv_in_panel.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
     snv_in_panel['hgvsp'] = snv_in_panel['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
     snv_in_panel['variant_detail'] = snv_in_panel.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
@@ -993,9 +1117,10 @@ def coreanalysis_detail(request):
                        left_on=['chrom','pos','ref_base','alt_base'],
                        right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
                        how='left')
-    
+    cols = ['clinvar__sig_conf','clinvar__sig','clinvar__rev_stat','clinvar__id']
+    snv_in_panel[cols] = snv_in_panel[cols].fillna('-')
     snv_in_panel['allele_balance'] = snv_in_panel['vcfinfo__af'].round(3)
-    
+
     ## assign info dict
     records = snv_in_panel.to_dict(orient='records')
     snv_in_panel['info'] = [
@@ -1016,14 +1141,14 @@ def coreanalysis_detail(request):
             },
             'consequence': {
                 'gene': r['gene'],
-                'transcript': r['transcript'],
-                'exon': r['exon'],
+                'transcript': r['mane_refseq_tx'],
+                'exon': int(r['exon']) if pd.notna(r['exon']) else '-',
                 'hgvsc': r['hgvsc'],
                 'hgvsp': r['hgvsp'],
                 'impact': r['impact'],
             },
             'clinvar': {
-                'clinical_significance': r['clinvar__sig'],
+                'clinical_significance': r['clinvar__sig_conf'] if pd.notna(r['clinvar__sig_conf']) else r['clinvar__sig'],
                 'review_status': r['clinvar__rev_stat'],
                 'clinvar_id': r['clinvar__id'],
             },
@@ -1052,17 +1177,21 @@ def coreanalysis_detail(request):
     ]
 
     snv_in_panel['chr']=snv_in_panel['chrom']
-
     ## section 1: reported variants
     report_variants_table = snv_in_panel[snv_in_panel['report']]
-    report_variants_table = report_variants_table[['chr','location','gene','transcript','variant_detail','total_reads','genotype','info']]
+    report_variants_table = report_variants_table[['chr','location','gene','mane_refseq_tx','variant_detail','total_reads','genotype','fulgent_report_times','info']]
+    report_variants_table = report_variants_table.rename(columns={'mane_refseq_tx':'transcript'})
     report_variants_table = report_variants_table.to_dict(orient="records")
 
     ## section 2: other variants within gene panel
     other_variants_table = snv_in_panel[~snv_in_panel['report']]
-    other_variants_table = other_variants_table[['chr','location','gene','transcript','variant_detail','total_reads','genotype','info']]
+    other_variants_table = other_variants_table[['chr','location','gene','mane_refseq_tx','variant_detail','total_reads','genotype','fulgent_report_times','info']]
+    other_variants_table = other_variants_table.rename(columns={'mane_refseq_tx':'transcript'})
     other_variants_table = other_variants_table.to_dict(orient="records")
 
+    other_variants_table_by_chr = defaultdict(list)
+    for var in other_variants_table:
+        other_variants_table_by_chr[var["chr"]].append(var)
 
     # copy number variant section
     ## section1: reported cnv
@@ -1086,22 +1215,28 @@ def coreanalysis_detail(request):
     other_cnv_table = {k: v for k, v in other_cnv_table.to_dict(orient='list').items()}
     other_cnv_table = safe_json_value(other_cnv_table)
 
-    #final = {
-    #    "quality_info":{"section1":wesQC1, "section2":wesQC2},
-    #    "analysis_info":{"section1":snv_report, "section2":cnv_report},
-    #    "snv_info":{"section1":report_variants_table,"section2":other_variants_table},
-    #    "cnv_info":{"section1":[],"section2":[]}
-    #}
     final = {
         "quality_info":{"section1":wesQC1, "section2":wesQC2},
         "analysis_info":{"section1":snv_report, "section2":cnv_report},
-        #"snv_info":{"section1":report_variants_table,"section2":other_variants_table},
-        #"cnv_info":{"section1":[],"section2":[]},
-        "sample_info":{"section1":[],"section2":[]}
+        "snv_info":{"section1":report_variants_table,"section2":other_variants_table_by_chr},
+        #"cnv_info":{"section1":[],"section2":[]}
     }
-     
+    print(f"report variants:{len(report_variants_table)}\nother variants:{len(other_variants_table)}\nused panel:{select_panel}") 
     print(final)
     return JsonResponse({"Code":200, "Msg": final})
+
+### API-T04
+def change_variant_report_status(request):
+    try:
+        sampleid = request.POST['sampleSNo']
+        chipid = request.POST['chipSNo']
+        location = request.POST['location']
+        status = request.POST['status']
+        variant_type = request.POST['type']
+        print(sampleid, chipid, location, status, variant_type)
+        return JsonResponse({"Code":500, "Msg": f"change variant {location} report status success!"})
+    except:
+        return JsonResponse({"Code":500, "Msg": "change variant report status failed!"})
 
 ## Management Section
 ### API-C01
@@ -1113,7 +1248,6 @@ def chipsearch(request):
         findstarttime = request.POST['findstarttime']
         findendtime = request.POST['findendtime']
         findstatus = request.POST['findstatus']
-        print("test")
         if userid is None:
             return JsonResponse({"Code":500, "Msg":"Error found on server"})
 
@@ -1795,4 +1929,38 @@ def addversion(request):
         return JsonResponse({"Code":200, "Msg":f"""你的版號第{version}號已經更新到系統上了，頁面請重新整理!"""})
     except:
         return JsonResponse({"Code":500, "Msg":"更新失敗!"})
+    
+### API-M12
+def gene_panel(request):
+    try:
+        sql = f"""SELECT 
+                    g.panel_name,
+                    i.gene,
+                    i.inheritance,
+                    i.condition_name
+                FROM gene_panel g
+                JOIN inheritance i
+                ON g.gene = i.gene
+                ORDER BY g.panel_name, g.gene;
+                """
+        gene_panel_df = sqlquery(sql)
+
+        panel_dict = defaultdict(list)
+        for _, row in gene_panel_df.iterrows():
+            panel_dict[row["panel_name"]].append({
+                "gene": row["gene"],
+                "inheritance": row["inheritance"],
+                "condition_name": row["condition_name"]
+            })
+
+        panel_with_count = {}
+        for panel_name, gene_list in panel_dict.items():
+            panel_with_count[panel_name] = {
+                "count": len(gene_list),
+                "genes": gene_list
+            }
+
+        return JsonResponse({"Code":200, "Msg": panel_with_count})
+    except:
+        return JsonResponse({"Code":500, "Msg":"gene_panel error!"})
     
