@@ -824,6 +824,8 @@ def auto_detect_panel_name(sex,sample_id):
         return(f"CSB_{sample_sex}")
     elif sample_id.startswith('CSF'):
         return(f"CSF_{sample_sex}")
+    elif sample_id.startswith('SA'):
+        return(f"SA")
     else:
         return(f"CSF_Female")
 
@@ -1222,19 +1224,68 @@ def coreanalysis_detail(request):
         #"cnv_info":{"section1":[],"section2":[]}
     }
     print(f"report variants:{len(report_variants_table)}\nother variants:{len(other_variants_table)}\nused panel:{select_panel}") 
-    print(final)
+    #print(final)
     return JsonResponse({"Code":200, "Msg": final})
 
 ### API-T04
 def change_variant_report_status(request):
+    status_dict = {'add':True,'remove':False}
     try:
         sampleid = request.POST['sampleSNo']
         chipid = request.POST['chipSNo']
         location = request.POST['location']
+        variants = json.loads(location)
         status = request.POST['status']
         variant_type = request.POST['type']
+        print(type(location))
         print(sampleid, chipid, location, status, variant_type)
-        return JsonResponse({"Code":500, "Msg": f"change variant {location} report status success!"})
+        
+        success_transactions = []
+        failed_transactions = []
+        for variant in variants:
+            if variant_type == 'snv':
+                chrom, pos, ref, alt = variant.split(":")
+                
+                try:
+                    variant_id = sqlexe(
+                        """
+                        SELECT variant_id FROM variant WHERE chrom=%s and pos=%s and ref_base=%s and alt_base=%s
+                        """,
+                        [chrom, int(pos), ref, alt],True)
+                    try:
+                        sqlexe(
+                            """
+                            UPDATE sample_variant SET report=%s WHERE sample_id=%s AND variant_id=%s
+                            """,
+                        [status_dict[status],f"{sampleid}_{chipid}",variant_id])
+                        success_transactions.append({variant:'success'})
+                    except Exception as e:
+                        failed_transactions.append({variant:"Error when changing status"})
+                except Exception as e:
+                    failed_transactions.append({variant:"No variant id is fetched in database"})
+                
+            else:
+                chrom, start_pos, end_pos, cn_type = variant.split(":")
+                try:
+                    variant_id = sqlexe(
+                        """
+                        SELECT variant_id FROM cnv WHERE chrom=%s and start_pos=%s and end_pos=%s and cn_type=%s
+                        """,
+                        [chrom, int(start_pos), int(end_pos), cn_type],True)
+                    try:
+                        sqlexe(
+                            """
+                            UPDATE sample_cnv SET report=%s WHERE sample_id=%s AND variant_id=%s
+                            """,
+                        [status_dict[status],f"{sampleid}_{chipid}",variant_id])
+                        success_transactions.append({variant:'success'})
+                    except Exception as e:
+                        failed_transactions.append({variant:"Error when changing status"})
+
+                except Exception as e:
+                    failed_transactions.append({variant:"No variant id is fetched in database"})
+        print(success_transactions)
+        return JsonResponse({"Code":200, "Msg": f"{status} variants\nSuccess:{len(success_transactions)}\nFail:{len(failed_transactions)}"})
     except:
         return JsonResponse({"Code":500, "Msg": "change variant report status failed!"})
 
@@ -1935,11 +1986,11 @@ def gene_panel(request):
     try:
         sql = f"""SELECT 
                     g.panel_name,
-                    i.gene,
+                    g.gene,
                     i.inheritance,
                     i.condition_name
                 FROM gene_panel g
-                JOIN inheritance i
+                LEFT JOIN inheritance i
                 ON g.gene = i.gene
                 ORDER BY g.panel_name, g.gene;
                 """
