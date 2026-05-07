@@ -511,7 +511,15 @@ class ImportToPostgres:
                 #             on=['SV_chrom','SV_start','SV_end'],
                 #             how='left')
                 variant_table['report']= variant_table['report'].astype('boolean').fillna(False)
-                
+                # ---------------------------------------------------------
+                # One row per CNV in sample_cnv.
+                # Non-panel genes are marked as reported during import 
+                # to avoid overwriting existing records.
+                # ----------------------------------------------------------
+                variant_table['report'] = (
+                        variant_table.groupby('AnnotSV_ID')['report']
+                        .transform('any')
+                )
                 ## 切割vcf information
                 variant_table[['GT', 'SM', 'CN', 'BC', 'PE']] = (
                     variant_table[variant_table['Samples_ID'].iloc[0]]
@@ -591,8 +599,8 @@ class ImportToPostgres:
                     
                     sample_variant_rows.append((
                     sample_id,variant_id,row_dict['GT'],row_dict['FILTER'],row_dict['QUAL'],row_dict['CN'],row_dict['SM'],
-                        row_dict['BC'],bool(row_dict['report']
-                    )))
+                        row_dict['BC'],bool(row_dict['report'])
+                    ))
 
                     consequence_rows.append((
                         variant_id,row_dict['Gene_name'],row_dict['transcript'],row_dict['exons'],row_dict['affect_exons'],"RefSeq"
