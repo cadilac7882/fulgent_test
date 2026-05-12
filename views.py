@@ -856,6 +856,22 @@ def collapse_ps_events(df):
         rows.append(row)
     return pd.DataFrame(rows)
 
+def find_bam_path(chipid,sampleid):
+    directories = sorted([d for d in os.listdir(NS2000_path) if os.path.isdir(os.path.join(NS2000_path, d))], reverse=True)
+    try:
+        folders = [directory for directory in directories if chipid in directory]
+    except Exception as e:
+        folders = None
+    if folders:
+        pattern = f"/{NS2000_path}/{folders[0]}/Analysis/[0-9]*/Data/{sampleid}/enrich_seq/{sampleid}.bam"
+        matches = glob.glob(pattern)
+    else:
+        matches = []
+    if len(matches)>0:
+        return matches[0],f"{matches[0]}.bai"
+    else:
+        return None,None
+
 #########################################API####################################################
 ## WESCoreAnalysis Section
 ### API-T01
@@ -1124,6 +1140,7 @@ def coreanalysis_detail(request):
     snv_in_panel['allele_balance'] = snv_in_panel['vcfinfo__af'].round(3)
 
     ## assign info dict
+    bam_path,bai_path=find_bam_path(chipid,sampleid)
     records = snv_in_panel.to_dict(orient='records')
     snv_in_panel['info'] = [
         {
@@ -1173,7 +1190,24 @@ def coreanalysis_detail(request):
                     'score':max(r['spliceai__ds_ag'],r['spliceai__ds_al'],r['spliceai__ds_dg'],r['spliceai__ds_dl']) if pd.notna(r['spliceai__ds_ag']) else '-',
                     'class':"Pathogenic" if max(r['spliceai__ds_ag'],r['spliceai__ds_al'],r['spliceai__ds_dg'],r['spliceai__ds_dl'])>0.5 else '-'
                 },
-            ]
+            ],
+            "igv_parameter":{
+                "genome": "hg38",
+                "locus": f"{r['chrom']}:{str(int(r['pos'])-5)}-{str(int(r['pos'])+5)}",
+                "tracks":[
+                    {
+                        "name": sampleid,
+                        "url":bam_path,
+                        "indexURL": bai_path,
+                        "format": "bam"
+                    },
+                    {
+                        "name": "target regions",
+                        "url": os.path.join(settings.BASE_DIR,"bin/hg38_Twist_Exome_2.5_Panel_annotated_custom_v2.BED"),
+                        "format": "bed"
+                    }
+                ]
+            }
         }
         for r in records
     ]
@@ -1224,7 +1258,7 @@ def coreanalysis_detail(request):
         #"cnv_info":{"section1":[],"section2":[]}
     }
     print(f"report variants:{len(report_variants_table)}\nother variants:{len(other_variants_table)}\nused panel:{select_panel}") 
-    #print(final)
+    print(final)
     return JsonResponse({"Code":200, "Msg": final})
 
 ### API-T04
