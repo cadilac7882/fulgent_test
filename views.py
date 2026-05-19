@@ -18,8 +18,10 @@ from zipfile import ZipFile
 import glob
 from django.contrib.auth.hashers import make_password, check_password
 from django.core.mail import send_mail
+from django.core.cache import cache
 from Crypto.Cipher import AES
 import base64
+import hashlib
 from collections import Counter
 import sqlite3
 import numpy as np
@@ -36,6 +38,7 @@ nextflow="/opt/nextflow"
 fail_mail_list=['ChenGyiLin@BionetTX.com']
 success_mail_list=['ChenGyiLin@BionetTX.com']
 KEY = 'GGANIPTSYSTEM0123456789876543210'.encode()
+OPENCRAVAT_CACHE_TIMEOUT = 60 * 60 * 12
 #########################################function###################################################
 def sqlexe(query, params=None, returnValue=False):
     """
@@ -872,6 +875,188 @@ def find_bam_path(chipid,sampleid):
     else:
         return None,None
 
+OPENCRAVAT_REQUIRED_COLUMNS = [
+    "base__chrom",
+    "base__pos",
+    "base__ref_base",
+    "base__alt_base",
+    "PS",
+    "mutalyzer_output",
+    "protein_description",
+    "clinvar__sig_conf",
+    "clinvar__sig",
+    "clinvar__rev_stat",
+    "clinvar__id",
+    "revel__rankscore",
+    "revel__pp3_pathogenic",
+    "vest__score",
+    "vest__pp3_pathogenic",
+    "dbscsnv__ada_score",
+    "spliceai__ds_ag",
+    "spliceai__ds_al",
+    "spliceai__ds_dg",
+    "spliceai__ds_dl",
+]
+for _gnomad_suffix in ["_afr", "_amr", "_eas", "_fin", "_nfe", "_sas", ""]:
+    OPENCRAVAT_REQUIRED_COLUMNS.extend([
+        f"gnomad4__af{_gnomad_suffix}",
+        f"gnomad4__ac{_gnomad_suffix}",
+        f"gnomad4__an{_gnomad_suffix}",
+        f"gnomad4__nhomalt{_gnomad_suffix}",
+    ])
+del _gnomad_suffix
+
+def ensure_dataframe_columns(df, columns):
+    for column in columns:
+        if column not in df.columns:
+            df[column] = np.nan
+    return df
+
+def get_chip_analysisfolder(chipid):
+    analysisfolder_df = sqlquery(
+        '''
+        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s
+        ''',
+        [chipid]
+    )
+    if analysisfolder_df.empty:
+        return None
+    return analysisfolder_df['analysisfolder'].loc[0]
+
+def get_opencravat_db_path(sampleid, chipid):
+    analysisfolder = get_chip_analysisfolder(chipid)
+    if analysisfolder is None:
+        return None
+    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", str(analysisfolder))
+    return os.path.join(file_path, sampleid, "opencravat", f"{sampleid}.hard-filtered.sqlite")
+
+def get_opencravat_cache_key(sampleid, chipid, db_path):
+    try:
+        sqlite_stat = os.stat(db_path)
+        sqlite_version = f"{int(sqlite_stat.st_mtime)}:{sqlite_stat.st_size}"
+    except (OSError, TypeError):
+        sqlite_version = "missing"
+    raw_key = f"{chipid}|{sampleid}|{db_path}|{sqlite_version}"
+    digest = hashlib.md5(raw_key.encode("utf-8")).hexdigest()
+    return f"opencravat_variant_update:{digest}"
+
+def empty_opencravat_annotation():
+    columns = {
+        column: pd.Series(dtype="int64" if column == "base__pos" else "object")
+        for column in OPENCRAVAT_REQUIRED_COLUMNS
+    }
+    return pd.DataFrame(columns)
+
+def get_opencravat_annotation_cached(sampleid, chipid):
+    db_path = get_opencravat_db_path(sampleid, chipid)
+    if db_path is None:
+        print(f"[{sampleid}] analysisfolder not found for chip: {chipid}")
+        return empty_opencravat_annotation()
+
+    cache_key = get_opencravat_cache_key(sampleid, chipid, db_path)
+    cached_table = cache.get(cache_key)
+    if cached_table is not None:
+        return cached_table.copy()
+
+    if not os.path.exists(db_path):
+        print(f"[{sampleid}] SQLite file not found: {db_path}")
+        return empty_opencravat_annotation()
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            snv_ann_table = pd.read_sql_query(
+                "SELECT * FROM variant_update;",
+                conn
+            )
+    except sqlite3.OperationalError as e:
+        print(f"[{sampleid}] SQLite error: {e}")
+        return empty_opencravat_annotation()
+    except Exception as e:
+        print(f"[{sampleid}] Unexpected error: {e}")
+        return empty_opencravat_annotation()
+
+    if 'report' in snv_ann_table.columns:
+        snv_ann_table = snv_ann_table.drop('report', axis=1)
+    snv_ann_table = ensure_dataframe_columns(snv_ann_table, OPENCRAVAT_REQUIRED_COLUMNS)
+    cache.set(cache_key, snv_ann_table, OPENCRAVAT_CACHE_TIMEOUT)
+    return snv_ann_table.copy()
+
+def get_sample_sex(sampleid, chipid):
+    sample_id = f"{sampleid}_{chipid}"
+    sex_df = sqlquery("""SELECT sex from "QCanalysis" WHERE "UniID" = %s""", [sample_id])
+    if not sex_df.empty:
+        return sex_df['sex'].loc[0]
+
+    sex_df = sqlquery(
+        '''
+        SELECT sex
+        FROM wescoreanalysis
+        WHERE "sampleSNo" = %s
+        AND "chipSNo" = %s
+        ''',
+        [sampleid, chipid]
+    )
+    if not sex_df.empty:
+        return sex_df['sex'].loc[0]
+    return None
+
+def get_analysis_info(sampleid, chipid, sex=None, snv_ann_table=None):
+    sample_id = f"{sampleid}_{chipid}"
+    if sex is None:
+        sex = get_sample_sex(sampleid, chipid)
+    select_panel_list = auto_detect_panel_name(sex, sample_id)
+    panel_placeholders = ','.join(['%s'] * len(select_panel_list))
+
+    if snv_ann_table is None:
+        snv_ann_table = get_opencravat_annotation_cached(sampleid, chipid)
+    snv_ann_table = ensure_dataframe_columns(snv_ann_table.copy(), OPENCRAVAT_REQUIRED_COLUMNS)
+
+    sql = """
+        SELECT *
+        FROM snv_annotation
+        WHERE sample_id = %s
+            AND report = TRUE
+     """
+    report_snv = sqlquery(sql, [sample_id])
+    if not report_snv.empty:
+        report_snv['hgvsp'] = report_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
+        report_snv['variant_detail'] = report_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}", axis=1)
+        report_snv['genotype'] = report_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+        snv_report = report_snv.merge(snv_ann_table,
+                           left_on=['chrom','pos','ref_base','alt_base'],
+                           right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
+                           how='left')
+        cols_keep = [
+            "gene","mane_refseq_tx","variant_detail","genotype",
+            "inheritance","condition_name",
+            "PS","mutalyzer_output","protein_description"
+        ]
+        snv_report = ensure_dataframe_columns(snv_report, cols_keep)
+        snv_report = snv_report.loc[:, cols_keep].copy()
+        snv_report = snv_report.rename(columns={'mane_refseq_tx':'transcript'})
+        snv_report = collapse_ps_events(snv_report)
+        snv_report = snv_report.to_dict(orient="records")
+    else:
+        snv_report = []
+
+    sql = f"""
+        SELECT *
+        FROM cnv_annotation
+        WHERE sample_id = %s
+            AND report = TRUE
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
+     """
+    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
+    if not report_cnv.empty:
+        report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}", axis=1)
+        report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
+        cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
+        cnv_report = cnv_report.to_dict(orient="records")
+    else:
+        cnv_report = []
+
+    return {"section1":snv_report, "section2":cnv_report}, select_panel_list
+
 #########################################API####################################################
 ## WESCoreAnalysis Section
 ### API-T01
@@ -1026,76 +1211,15 @@ def coreanalysis_detail(request):
     wesQC2 = safe_json_value(wesQC2)
 
     # Analysis info section
-    ## load opencravat annotation table
-    analysisfolder=sqlquery(
-        '''
-        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s 
-        ''',
-        [chipid])['analysisfolder'].loc[0]
-    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
-    db_path = f"{file_path}/{sampleid}/opencravat/{sampleid}.hard-filtered.sqlite"
-
-    try:
-        with sqlite3.connect(db_path) as conn:
-            snv_ann_table = pd.read_sql_query(
-                "SELECT * FROM variant_update;",
-                conn
-            )
-    except sqlite3.OperationalError as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] SQLite error: {e}")
-    except Exception as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] Unexpected error: {e}")
-
-    ## drop report column in sqlite to avoid duplicated report
-    snv_ann_table = snv_ann_table.drop('report',axis=1)
-    
-    ## section 1: SNV reuslts
     sample_id = f"{sampleid}_{chipid}"
-    select_panel_list = auto_detect_panel_name(wesQC1['sex'],sample_id)
+    snv_ann_table = get_opencravat_annotation_cached(sampleid, chipid)
+    analysis_info, select_panel_list = get_analysis_info(
+        sampleid,
+        chipid,
+        wesQC1['sex'],
+        snv_ann_table
+    )
     panel_placeholders = ','.join(['%s'] * len(select_panel_list))
-
-    sql = """
-        SELECT *
-        FROM snv_annotation
-        WHERE sample_id = %s
-            AND report = TRUE
-     """
-    report_snv = sqlquery(sql, [sample_id]) 
-    # print(report_snv.columns)
-    
-    report_snv['hgvsp']=report_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
-    report_snv['variant_detail']=report_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
-    report_snv['genotype'] = report_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    # snv_report = report_snv[["gene" ,'mane_refseq_tx','variant_detail','genotype','inheritance','condition_name']]
-    snv_report = report_snv.merge(snv_ann_table,
-                       left_on=['chrom','pos','ref_base','alt_base'],
-                       right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
-                       how='left')
-    cols_keep = [
-        "gene","mane_refseq_tx","variant_detail","genotype",
-        "inheritance","condition_name",
-        "PS","mutalyzer_output","protein_description"
-    ]
-    snv_report = snv_report.loc[:, cols_keep].copy()
-    snv_report = snv_report.rename(columns={'mane_refseq_tx':'transcript'})
-    snv_report = collapse_ps_events(snv_report) 
-    snv_report = snv_report.to_dict(orient="records")
-
-    ## section 2: CNV reuslts
-    sql = f"""
-        SELECT *
-        FROM cnv_annotation
-        WHERE sample_id = %s
-            AND report = TRUE
-            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
-     """
-    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
-    report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
-    report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
-    cnv_report = cnv_report.to_dict(orient="records")
 
     # small variant section
     ## query variants inside gene panel
@@ -1212,10 +1336,22 @@ def coreanalysis_detail(request):
 
     # copy number variant section
     ## section1: reported cnv
-    report_cnv['location']=report_cnv.apply(lambda x: f"{x['chrom']}:{str(x['start_pos'])}:{x['end_pos']}:{x['cn_type']}",axis=1)
-    report_cnv_table = report_cnv[['location','gene','transcript','variant_detail','quality','genotype']]
-    report_cnv_table = {k: v for k, v in report_cnv_table.to_dict(orient='list').items()}
-    report_cnv_table = safe_json_value(report_cnv_table)
+    sql = f"""
+        SELECT *
+        FROM cnv_annotation
+        WHERE sample_id = %s
+            AND report = TRUE
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
+     """
+    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
+    if not report_cnv.empty:
+        report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
+        report_cnv['location']=report_cnv.apply(lambda x: f"{x['chrom']}:{str(x['start_pos'])}:{x['end_pos']}:{x['cn_type']}",axis=1)
+        report_cnv_table = report_cnv[['location','gene','transcript','variant_detail','quality','genotype']]
+        report_cnv_table = {k: v for k, v in report_cnv_table.to_dict(orient='list').items()}
+        report_cnv_table = safe_json_value(report_cnv_table)
+    else:
+        report_cnv_table = {}
 
     ## section2: other cnv
     sql='''
@@ -1234,7 +1370,7 @@ def coreanalysis_detail(request):
 
     final = {
         "quality_info":{"section1":wesQC1, "section2":wesQC2},
-        "analysis_info":{"section1":snv_report, "section2":cnv_report},
+        "analysis_info":analysis_info,
         "snv_info":{"section1":report_variants_table,"section2":other_variants_table_by_chr},
         #"cnv_info":{"section1":[],"section2":[]}
     }
@@ -1300,7 +1436,19 @@ def change_variant_report_status(request):
                 except Exception as e:
                     failed_transactions.append({variant:"No variant id is fetched in database"})
         print(success_transactions)
-        return JsonResponse({"Code":200, "Msg": f"{status} variants\nSuccess:{len(success_transactions)}\nFail:{len(failed_transactions)}"})
+        analysis_info, _ = get_analysis_info(sampleid, chipid)
+        return JsonResponse({
+            "Code":200,
+            "Msg": {
+                "message": f"{status} variants\nSuccess:{len(success_transactions)}\nFail:{len(failed_transactions)}",
+                "status": status,
+                "success": len(success_transactions),
+                "fail": len(failed_transactions),
+                "success_transactions": success_transactions,
+                "failed_transactions": failed_transactions,
+                "analysis_info": analysis_info
+            }
+        })
     except:
         return JsonResponse({"Code":500, "Msg": "change variant report status failed!"})
 
@@ -1313,79 +1461,9 @@ def report_variants(request):
 
     if userid is None:
         return JsonResponse({"Code":500, "Msg":"Error found on server"})
-    # Analysis info section
-    ## load opencravat annotation table
-    analysisfolder=sqlquery(
-        '''
-        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s 
-        ''',
-        [chipid])['analysisfolder'].loc[0]
-    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
-    db_path = f"{file_path}/{sampleid}/opencravat/{sampleid}.hard-filtered.sqlite"
-
-    try:
-        with sqlite3.connect(db_path) as conn:
-            snv_ann_table = pd.read_sql_query(
-                "SELECT * FROM variant_update;",
-                conn
-            )
-    except sqlite3.OperationalError as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] SQLite error: {e}")
-    except Exception as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] Unexpected error: {e}")
-
-
-    
-    ## section 1: SNV reuslts
-    sample_id = f"{sampleid}_{chipid}"
-    sex = sqlquery("""SELECT sex from "QCanalysis" WHERE "UniID" = %s""",[sample_id])['sex'].loc[0]
-    select_panel_list = auto_detect_panel_name(sex, sample_id)
-    panel_placeholders = ','.join(['%s'] * len(select_panel_list))
-    sql = """
-        SELECT *
-        FROM snv_annotation
-        WHERE sample_id = %s
-            AND report = TRUE
-     """
-    report_snv = sqlquery(sql, [sample_id]) 
-    # print(report_snv.columns)
-    
-    report_snv['hgvsp']=report_snv['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
-    report_snv['variant_detail']=report_snv.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
-    report_snv['genotype'] = report_snv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    # snv_report = report_snv[["gene" ,'mane_refseq_tx','variant_detail','genotype','inheritance','condition_name']]
-    snv_report = report_snv.merge(snv_ann_table,
-                       left_on=['chrom','pos','ref_base','alt_base'],
-                       right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
-                       how='left')
-    cols_keep = [
-        "gene","mane_refseq_tx","variant_detail","genotype",
-        "inheritance","condition_name",
-        "PS","mutalyzer_output","protein_description"
-    ]
-    snv_report = snv_report.loc[:, cols_keep].copy()
-    snv_report = snv_report.rename(columns={'mane_refseq_tx':'transcript'})
-    snv_report = collapse_ps_events(snv_report) 
-    snv_report = snv_report.to_dict(orient="records")
-
-    ## section 2: CNV reuslts
-    sql = f"""
-        SELECT *
-        FROM cnv_annotation
-        WHERE sample_id = %s
-            AND report = TRUE
-            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
-     """
-    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
-    report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
-    report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
-    cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
-    cnv_report = cnv_report.to_dict(orient="records")
-
+    analysis_info, _ = get_analysis_info(sampleid, chipid)
     final = {
-        "analysis_info":{"section1":snv_report, "section2":cnv_report},
+        "analysis_info":analysis_info,
     } 
     #print(final)
     return JsonResponse({"Code":200, "Msg": final})
