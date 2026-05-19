@@ -821,13 +821,13 @@ def auto_detect_panel_name(sex,sample_id):
     assign panel
     '''
     if sample_id.startswith('CSB'):
-        return(f"CSB_{sample_sex}")
+        return [f"CSB_{sample_sex}", "CSC", "CSH"]
     elif sample_id.startswith('CSF'):
-        return(f"CSF_{sample_sex}")
+        return [f"CSF_{sample_sex}"]
     elif sample_id.startswith('SA'):
-        return(f"SA")
+        return ["SA"]
     else:
-        return(f"CSF_Female")
+        return ["CSF_Female"]
 
 def collapse_ps_events(df):
     df = df.copy()
@@ -1048,8 +1048,14 @@ def coreanalysis_detail(request):
         snv_ann_table = None
         print(f"[{sampleid}] Unexpected error: {e}")
 
+    ## drop report column in sqlite to avoid duplicated report
+    snv_ann_table = snv_ann_table.drop('report',axis=1)
+    
     ## section 1: SNV reuslts
     sample_id = f"{sampleid}_{chipid}"
+    select_panel_list = auto_detect_panel_name(wesQC1['sex'],sample_id)
+    panel_placeholders = ','.join(['%s'] * len(select_panel_list))
+
     sql = """
         SELECT *
         FROM snv_annotation
@@ -1078,14 +1084,14 @@ def coreanalysis_detail(request):
     snv_report = snv_report.to_dict(orient="records")
 
     ## section 2: CNV reuslts
-    sql = """
+    sql = f"""
         SELECT *
         FROM cnv_annotation
         WHERE sample_id = %s
             AND report = TRUE
-            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name = %s)
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
      """
-    report_cnv = sqlquery(sql, [sample_id,panel_name])
+    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
     report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
     report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
     cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
@@ -1093,44 +1099,19 @@ def coreanalysis_detail(request):
 
     # small variant section
     ## query variants inside gene panel
-    sql='''
+    sql = f'''
         SELECT *
         FROM snv_annotation
         WHERE sample_id = %s
-            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name = %s) 
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders})) 
         '''
     
-    select_panel=auto_detect_panel_name(wesQC1['sex'],sample_id)
-    
-    snv_in_panel = sqlquery(sql, [sample_id,select_panel])
+    snv_in_panel = sqlquery(sql, [sample_id] + select_panel_list)
     snv_in_panel['location'] = snv_in_panel.apply(lambda x: f"{x['chrom']}:{str(x['pos'])}:{x['ref_base']}:{x['alt_base']}",axis=1)
     snv_in_panel['hgvsp'] = snv_in_panel['hgvsp'].apply(lambda x: 'p.?' if pd.isna(x) else x)
     snv_in_panel['variant_detail'] = snv_in_panel.apply(lambda x: f"{x['hgvsc']}, {x['hgvsp']}",axis=1)
     snv_in_panel['genotype'] = snv_in_panel['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
 
-    ## load opencravat annotation table
-    analysisfolder=sqlquery(
-        '''
-        SELECT analysisfolder FROM chip_info WHERE "chipSNo" = %s 
-        ''',
-        [chipid])['analysisfolder'].loc[0]
-    file_path = os.path.join(settings.BASE_DIR, "wes", "static", "analysis", analysisfolder)
-    db_path = f"{file_path}/{sampleid}/opencravat/{sampleid}.hard-filtered.sqlite"
-
-    try:
-        with sqlite3.connect(db_path) as conn:
-            snv_ann_table = pd.read_sql_query(
-                "SELECT * FROM variant;",
-                conn
-            )
-    except sqlite3.OperationalError as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] SQLite error: {e}")
-    except Exception as e:
-        snv_ann_table = None
-        print(f"[{sampleid}] Unexpected error: {e}")
-
-    ## merge two tables
     snv_in_panel = snv_in_panel.merge(snv_ann_table,
                        left_on=['chrom','pos','ref_base','alt_base'],
                        right_on=['base__chrom','base__pos','base__ref_base','base__alt_base'],
@@ -1257,7 +1238,7 @@ def coreanalysis_detail(request):
         "snv_info":{"section1":report_variants_table,"section2":other_variants_table_by_chr},
         #"cnv_info":{"section1":[],"section2":[]}
     }
-    print(f"report variants:{len(report_variants_table)}\nother variants:{len(other_variants_table)}\nused panel:{select_panel}") 
+    print(f"report variants:{len(report_variants_table)}\nother variants:{len(other_variants_table)}\nused panel:{select_panel_list}") 
     #print(final)
     return JsonResponse({"Code":200, "Msg": final})
 
@@ -1360,7 +1341,8 @@ def report_variants(request):
     ## section 1: SNV reuslts
     sample_id = f"{sampleid}_{chipid}"
     sex = sqlquery("""SELECT sex from "QCanalysis" WHERE "UniID" = %s""",[sample_id])['sex'].loc[0]
-    panel_name = auto_detect_panel_name(sex,sample_id)
+    select_panel_list = auto_detect_panel_name(sex, sample_id)
+    panel_placeholders = ','.join(['%s'] * len(select_panel_list))
     sql = """
         SELECT *
         FROM snv_annotation
@@ -1389,14 +1371,14 @@ def report_variants(request):
     snv_report = snv_report.to_dict(orient="records")
 
     ## section 2: CNV reuslts
-    sql = """
+    sql = f"""
         SELECT *
         FROM cnv_annotation
         WHERE sample_id = %s
             AND report = TRUE
-            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name = %s)
+            AND gene IN (SELECT gene FROM gene_panel WHERE panel_name IN ({panel_placeholders}))
      """
-    report_cnv = sqlquery(sql, [sample_id, panel_name])
+    report_cnv = sqlquery(sql, [sample_id] + select_panel_list)
     report_cnv['variant_detail'] = report_cnv.apply(lambda x: f"{x['affect_exons']} {x['cn_type']}",axis=1)
     report_cnv['genotype'] = report_cnv['genotype'].replace({'unknown':'-','het':'Heterozygous','hom':'Homozygous'})
     cnv_report = report_cnv[["gene" ,'transcript','variant_detail','genotype','inheritance','condition_name']]
